@@ -36,18 +36,6 @@ jobs:
             --exclude='node_modules/' \
             "$GITHUB_WORKSPACE/" /home/ubuntu/minecraft-bot/
 
-      - name: Install native dependencies for canvas
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential \
-            pkg-config \
-            libcairo2-dev \
-            libpango1.0-dev \
-            libjpeg-dev \
-            libgif-dev \
-            librsvg2-dev
-
       - name: Install production dependencies
         working-directory: /home/ubuntu/minecraft-bot
         run: npm install --omit=dev --no-audit --no-fund

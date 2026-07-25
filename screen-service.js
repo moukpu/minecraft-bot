@@ -16,15 +16,14 @@ class ScreenService {
     this.viewerBot = null;
     this.browser = null;
     this.page = null;
+    this.pageMode = null;
     this.viewerStarted = false;
-    this.lastError = null;
     this.capturePromise = null;
   }
 
   async attach(bot) {
     await this.detachViewer();
     this.bot = bot;
-    this.lastError = null;
 
     const viewerVersion = bot.version === '1.16.5' ? '1.16.4' : bot.version;
     this.viewerBot = viewerVersion === bot.version
@@ -46,18 +45,12 @@ class ScreenService {
       await sleep(800);
     } catch (error) {
       this.viewerStarted = false;
-      this.lastError = error;
       console.error('Не удалось запустить Prismarine Viewer:', error);
     }
   }
 
   async detachViewer() {
-    if (this.page) {
-      try {
-        await this.page.close();
-      } catch {}
-      this.page = null;
-    }
+    await this.closePage();
 
     if (this.bot?.viewer?.close) {
       try {
@@ -69,6 +62,17 @@ class ScreenService {
     this.viewerBot = null;
     this.bot = null;
     await sleep(250);
+  }
+
+  async closePage() {
+    if (this.page) {
+      try {
+        await this.page.close();
+      } catch {}
+    }
+
+    this.page = null;
+    this.pageMode = null;
   }
 
   async close() {
@@ -108,57 +112,76 @@ class ScreenService {
     this.browser.on('disconnected', () => {
       this.browser = null;
       this.page = null;
+      this.pageMode = null;
     });
 
     return this.browser;
   }
 
   async ensurePage() {
-    if (!this.viewerStarted || !this.bot) {
-      throw new Error('Рендер ещё не запущен. Сначала подключи Minecraft-бота.');
+    const wantedMode = this.viewerStarted && this.bot?.entity ? 'viewer' : 'blank';
+
+    if (this.page && !this.page.isClosed() && this.pageMode === wantedMode) {
+      return this.page;
     }
 
-    if (this.page && !this.page.isClosed()) return this.page;
+    await this.closePage();
 
     const browser = await this.ensureBrowser();
     const page = await browser.newPage();
-    await page.setViewport({ width: this.width, height: this.height, deviceScaleFactor: 1 });
+    await page.setViewport({
+      width: this.width,
+      height: this.height,
+      deviceScaleFactor: 1
+    });
 
     page.on('pageerror', error => {
-      console.error('Ошибка страницы Prismarine Viewer:', error.message);
+      console.error('Ошибка страницы скриншота:', error.message);
     });
 
-    let lastError = null;
+    if (wantedMode === 'viewer') {
+      let lastError = null;
 
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
-      try {
-        await page.goto(`http://127.0.0.1:${this.port}`, {
-          waitUntil: 'domcontentloaded',
-          timeout: 15000
-        });
-        await page.waitForSelector('canvas', { timeout: 15000 });
-        lastError = null;
-        break;
-      } catch (error) {
-        lastError = error;
-        await sleep(1000);
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        try {
+          await page.goto(`http://127.0.0.1:${this.port}`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 15000
+          });
+          await page.waitForSelector('canvas', { timeout: 15000 });
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          await sleep(1000);
+        }
       }
+
+      if (lastError) {
+        await page.close().catch(() => {});
+        throw new Error(`Viewer не открылся: ${lastError.message}`);
+      }
+
+      await page.addStyleTag({
+        content: `
+          html, body { margin: 0 !important; width: 100% !important; height: 100% !important; overflow: hidden !important; background: #111 !important; }
+          canvas { display: block !important; width: 100vw !important; height: 100vh !important; }
+        `
+      });
+
+      await sleep(1800);
+    } else {
+      await page.setContent(`
+        <!doctype html>
+        <html>
+          <head><meta charset="utf-8"></head>
+          <body style="margin:0;width:100vw;height:100vh;overflow:hidden;background:linear-gradient(#202a35,#0d1015);"></body>
+        </html>
+      `, { waitUntil: 'domcontentloaded' });
     }
 
-    if (lastError) {
-      await page.close().catch(() => {});
-      throw new Error(`Viewer не открылся: ${lastError.message}`);
-    }
-
-    await page.addStyleTag({
-      content: `
-        html, body { margin: 0 !important; width: 100% !important; height: 100% !important; overflow: hidden !important; background: #111 !important; }
-        canvas { display: block !important; width: 100vw !important; height: 100vh !important; }
-      `
-    });
-
-    await sleep(2200);
     this.page = page;
+    this.pageMode = wantedMode;
     return page;
   }
 
@@ -178,6 +201,45 @@ class ScreenService {
         'text-shadow:0 2px 3px #000,0 0 3px #000'
       ].join(';');
 
+      if (payload.mapDataUrl) {
+        const dimmer = document.createElement('div');
+        dimmer.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,0,.58)';
+        root.appendChild(dimmer);
+
+        const mapFrame = document.createElement('div');
+        mapFrame.style.cssText = [
+          'position:absolute',
+          'left:50%',
+          'top:50%',
+          'transform:translate(-50%,-50%)',
+          'width:min(58vw,560px)',
+          'height:min(58vw,560px)',
+          'max-height:76vh',
+          'aspect-ratio:1/1',
+          'padding:12px',
+          'box-sizing:border-box',
+          'background:#7a5235',
+          'border:8px solid #3b2518',
+          'box-shadow:0 18px 60px rgba(0,0,0,.75)'
+        ].join(';');
+
+        const mapImage = document.createElement('img');
+        mapImage.src = payload.mapDataUrl;
+        mapImage.style.cssText = 'width:100%;height:100%;object-fit:contain;image-rendering:pixelated;background:#1e1e1e;display:block';
+        mapFrame.appendChild(mapImage);
+        root.appendChild(mapFrame);
+
+        const mapTitle = document.createElement('div');
+        mapTitle.style.cssText = 'position:absolute;left:50%;top:18px;transform:translateX(-50%);padding:9px 15px;border-radius:9px;background:rgba(0,0,0,.72);font-size:18px;font-weight:700';
+        mapTitle.textContent = 'Карта в руке / капча';
+        root.appendChild(mapTitle);
+      } else {
+        const crosshair = document.createElement('div');
+        crosshair.style.cssText = 'position:absolute;left:50%;top:50%;width:22px;height:22px;transform:translate(-50%,-50%)';
+        crosshair.innerHTML = '<div style="position:absolute;left:10px;top:0;width:2px;height:22px;background:#fff;box-shadow:0 0 2px #000"></div><div style="position:absolute;left:0;top:10px;width:22px;height:2px;background:#fff;box-shadow:0 0 2px #000"></div>';
+        root.appendChild(crosshair);
+      }
+
       const status = document.createElement('div');
       status.style.cssText = 'position:absolute;left:18px;top:18px;max-width:430px;padding:12px 14px;border-radius:10px;background:rgba(0,0,0,.58);font-size:17px;line-height:1.4;white-space:pre-wrap';
       status.textContent = payload.status;
@@ -185,15 +247,10 @@ class ScreenService {
 
       if (payload.windowTitle) {
         const windowTitle = document.createElement('div');
-        windowTitle.style.cssText = 'position:absolute;left:50%;top:20px;transform:translateX(-50%);padding:9px 15px;border-radius:9px;background:rgba(0,0,0,.64);font-size:18px;font-weight:700';
+        windowTitle.style.cssText = 'position:absolute;right:18px;top:18px;max-width:360px;padding:9px 15px;border-radius:9px;background:rgba(0,0,0,.64);font-size:18px;font-weight:700';
         windowTitle.textContent = `Открыто меню: ${payload.windowTitle}`;
         root.appendChild(windowTitle);
       }
-
-      const crosshair = document.createElement('div');
-      crosshair.style.cssText = 'position:absolute;left:50%;top:50%;width:22px;height:22px;transform:translate(-50%,-50%)';
-      crosshair.innerHTML = '<div style="position:absolute;left:10px;top:0;width:2px;height:22px;background:#fff;box-shadow:0 0 2px #000"></div><div style="position:absolute;left:0;top:10px;width:22px;height:2px;background:#fff;box-shadow:0 0 2px #000"></div>';
-      root.appendChild(crosshair);
 
       if (payload.messages.length) {
         const chat = document.createElement('div');
@@ -247,13 +304,7 @@ class ScreenService {
     try {
       return await this.capturePromise;
     } catch (error) {
-      this.lastError = error;
-      if (this.page) {
-        try {
-          await this.page.close();
-        } catch {}
-        this.page = null;
-      }
+      await this.closePage();
       throw error;
     } finally {
       this.capturePromise = null;

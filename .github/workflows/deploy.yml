@@ -44,7 +44,7 @@ jobs:
         working-directory: /home/ubuntu/minecraft-bot
         run: |
           pm2 delete minecraft-bot >/dev/null 2>&1 || true
-          pm2 start bot.js --name minecraft-bot --time
+          NODE_OPTIONS="--require=/home/ubuntu/minecraft-bot/hotbar-fix.js" pm2 start bot.js --name minecraft-bot --time
           pm2 save
 
       - name: Wait until bot is ready

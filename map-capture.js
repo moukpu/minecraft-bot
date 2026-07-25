@@ -1,9 +1,6 @@
 'use strict';
 
-const crypto = require('crypto');
 const { PNG } = require('pngjs');
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function unsignedByte(value) {
   const number = Number(value || 0);
@@ -11,19 +8,24 @@ function unsignedByte(value) {
 }
 
 class MapCapture {
-  constructor(onImage) {
-    this.onImage = onImage;
+  constructor() {
     this.bot = null;
     this.listener = null;
     this.maps = new Map();
-    this.timers = new Map();
-    this.hashes = new Map();
+    this.renderTimer = null;
     this.colorsPromise = null;
     this.lastImage = null;
+    this.lastMapId = null;
+    this.lastPacketAt = 0;
+    this.lastUpdatedAt = 0;
   }
 
   attach(bot) {
     this.detach();
+    this.lastImage = null;
+    this.lastMapId = null;
+    this.lastPacketAt = 0;
+    this.lastUpdatedAt = 0;
     this.bot = bot;
     this.listener = packet => this.handlePacket(packet);
     bot._client.on('map', this.listener);
@@ -34,8 +36,8 @@ class MapCapture {
       this.bot._client.removeListener('map', this.listener);
     }
 
-    for (const timer of this.timers.values()) clearTimeout(timer);
-    this.timers.clear();
+    if (this.renderTimer) clearTimeout(this.renderTimer);
+    this.renderTimer = null;
     this.maps.clear();
     this.bot = null;
     this.listener = null;
@@ -43,8 +45,10 @@ class MapCapture {
 
   async getColors() {
     if (!this.colorsPromise) {
-      this.colorsPromise = import('@aresrpg/aresrpg-map-colors').then(module => module.default || module);
+      this.colorsPromise = import('@aresrpg/aresrpg-map-colors')
+        .then(module => module.default || module);
     }
+
     return this.colorsPromise;
   }
 
@@ -77,39 +81,36 @@ class MapCapture {
       for (let index = 0; index < expected; index += 1) {
         const x = startX + (index % columns);
         const y = startY + Math.floor(index / columns);
+
         if (x >= 0 && x < 128 && y >= 0 && y < 128) {
           pixels[y * 128 + x] = data[index];
         }
       }
 
       this.maps.set(mapId, pixels);
-      this.scheduleRender(mapId, Buffer.from(pixels));
+      this.lastMapId = mapId;
+      this.lastPacketAt = Date.now();
+      this.scheduleRender();
     } catch (error) {
       console.error('Ошибка чтения map-пакета:', error);
     }
   }
 
-  scheduleRender(mapId, pixels) {
-    const oldTimer = this.timers.get(mapId);
-    if (oldTimer) clearTimeout(oldTimer);
+  scheduleRender() {
+    if (this.renderTimer) clearTimeout(this.renderTimer);
 
-    const timer = setTimeout(async () => {
-      this.timers.delete(mapId);
+    this.renderTimer = setTimeout(async () => {
+      this.renderTimer = null;
+      const pixels = this.maps.get(this.lastMapId);
+      if (!pixels) return;
 
       try {
-        const hash = crypto.createHash('sha256').update(pixels).digest('hex');
-        if (this.hashes.get(mapId) === hash) return;
-
-        const image = await this.render(pixels);
-        this.hashes.set(mapId, hash);
-        this.lastImage = image;
-        await this.onImage(image, mapId);
+        this.lastImage = await this.render(Buffer.from(pixels));
+        this.lastUpdatedAt = Date.now();
       } catch (error) {
         console.error('Ошибка рендера карты:', error);
       }
-    }, 700);
-
-    this.timers.set(mapId, timer);
+    }, 900);
   }
 
   async render(pixels) {
@@ -145,7 +146,6 @@ class MapCapture {
       }
     }
 
-    await sleep(0);
     return PNG.sync.write(png);
   }
 }

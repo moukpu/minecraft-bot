@@ -21,8 +21,16 @@ class InventoryController {
     this.notify = notify;
     this.onState = onState;
     this.bot = null;
+    this.Item = null;
     this.listeners = [];
+    this.clientListeners = [];
+    this.inventoryListener = null;
     this.currentWindow = null;
+    this.shadowInventory = new Map();
+    this.inventoryPackets = 0;
+    this.inventoryParseErrors = 0;
+    this.hotbarAnnounced = false;
+    this.hotbarNotifyTimer = null;
     this.lastGuiClickAt = 0;
     this.pendingCloseTimer = null;
     this.loadingTimer = null;
@@ -34,7 +42,12 @@ class InventoryController {
   attach(bot) {
     this.detach();
     this.bot = bot;
+    this.Item = require('prismarine-item')(bot.registry);
     this.currentWindow = bot.currentWindow || null;
+    this.shadowInventory.clear();
+    this.inventoryPackets = 0;
+    this.inventoryParseErrors = 0;
+    this.hotbarAnnounced = false;
 
     this.listen('windowOpen', window => this.handleWindowOpen(window));
     this.listen('windowClose', window => this.handleWindowClose(window));
@@ -42,6 +55,14 @@ class InventoryController {
     this.listen('game', () => this.handleWorldSignal('смена режима/мира'));
     this.listen('spawn', () => this.handleWorldSignal('spawn'));
     this.listen('forcedMove', () => this.handleWorldSignal('телепортация'));
+
+    this.listenClient('set_slot', packet => this.handleRawSetSlot(packet));
+    this.listenClient('window_items', packet => this.handleRawWindowItems(packet));
+
+    this.inventoryListener = () => this.scheduleHotbarNotification();
+    bot.inventory.on('updateSlot', this.inventoryListener);
+
+    setTimeout(() => this.scheduleHotbarNotification(), 1200);
   }
 
   detach() {
@@ -49,26 +70,156 @@ class InventoryController {
       for (const [event, listener] of this.listeners) {
         this.bot.removeListener(event, listener);
       }
+
+      for (const [event, listener] of this.clientListeners) {
+        this.bot._client.removeListener(event, listener);
+      }
+
+      if (this.inventoryListener) {
+        this.bot.inventory.removeListener('updateSlot', this.inventoryListener);
+      }
     }
 
     this.listeners = [];
+    this.clientListeners = [];
+    this.inventoryListener = null;
     this.bot = null;
+    this.Item = null;
     this.currentWindow = null;
+    this.shadowInventory.clear();
+    this.inventoryPackets = 0;
+    this.inventoryParseErrors = 0;
+    this.hotbarAnnounced = false;
     this.loading = false;
     this.loadingReason = '';
 
-    if (this.pendingCloseTimer) clearTimeout(this.pendingCloseTimer);
-    if (this.loadingTimer) clearTimeout(this.loadingTimer);
-    if (this.loadingFallbackTimer) clearTimeout(this.loadingFallbackTimer);
+    for (const timer of [
+      this.pendingCloseTimer,
+      this.loadingTimer,
+      this.loadingFallbackTimer,
+      this.hotbarNotifyTimer
+    ]) {
+      if (timer) clearTimeout(timer);
+    }
 
     this.pendingCloseTimer = null;
     this.loadingTimer = null;
     this.loadingFallbackTimer = null;
+    this.hotbarNotifyTimer = null;
   }
 
   listen(event, listener) {
     this.bot.on(event, listener);
     this.listeners.push([event, listener]);
+  }
+
+  listenClient(event, listener) {
+    this.bot._client.on(event, listener);
+    this.clientListeners.push([event, listener]);
+  }
+
+  normalizeWindowId(value) {
+    const number = Number(value);
+    if (number === 254) return -2;
+    if (number === 255) return -1;
+    return number;
+  }
+
+  parsePacketItem(rawItem) {
+    try {
+      return this.Item.fromNotch(rawItem);
+    } catch (error) {
+      this.inventoryParseErrors += 1;
+      console.error('Не удалось разобрать предмет инвентаря:', error.message);
+      return null;
+    }
+  }
+
+  handleRawSetSlot(packet) {
+    this.inventoryPackets += 1;
+    const windowId = this.normalizeWindowId(packet.windowId);
+    const slot = Number(packet.slot);
+
+    if (!Number.isInteger(slot) || slot < 0) return;
+    const item = this.parsePacketItem(packet.item);
+
+    if (windowId === 0 || windowId === -2) {
+      this.shadowInventory.set(slot, item);
+    }
+
+    // Bukkit/Spigot-серверы нередко используют -2 для прямого обновления
+    // инвентаря игрока. Mineflayer такой пакет игнорирует, поэтому применяем его сами.
+    if (windowId === -2 && this.bot?.inventory) {
+      try {
+        if (typeof this.bot._setSlot === 'function') {
+          this.bot._setSlot(slot, item, this.bot.inventory);
+        } else {
+          this.bot.inventory.updateSlot(slot, item);
+          this.bot.updateHeldItem?.();
+        }
+      } catch (error) {
+        console.error(`Не удалось применить set_slot -2 для слота ${slot}:`, error.message);
+      }
+    }
+
+    this.scheduleHotbarNotification();
+  }
+
+  handleRawWindowItems(packet) {
+    this.inventoryPackets += 1;
+    const windowId = this.normalizeWindowId(packet.windowId);
+    if (windowId !== 0 || !Array.isArray(packet.items)) return;
+
+    for (let slot = 0; slot < packet.items.length; slot += 1) {
+      this.shadowInventory.set(slot, this.parsePacketItem(packet.items[slot]));
+    }
+
+    this.scheduleHotbarNotification();
+  }
+
+  hotbarStart() {
+    return Number(
+      this.bot?.QUICK_BAR_START ??
+      this.bot?.inventory?.hotbarStart ??
+      36
+    );
+  }
+
+  inventoryItem(slot) {
+    return this.bot?.inventory?.slots?.[slot] ?? this.shadowInventory.get(slot) ?? null;
+  }
+
+  hotbarItems() {
+    const start = this.hotbarStart();
+    return Array.from({ length: 9 }, (_, index) => this.inventoryItem(start + index));
+  }
+
+  scheduleHotbarNotification() {
+    if (!this.bot || this.hotbarAnnounced) return;
+    if (this.hotbarNotifyTimer) clearTimeout(this.hotbarNotifyTimer);
+
+    this.hotbarNotifyTimer = setTimeout(() => {
+      this.hotbarNotifyTimer = null;
+      if (!this.bot || this.hotbarAnnounced) return;
+
+      const items = this.hotbarItems();
+      if (!items.some(Boolean)) return;
+
+      this.hotbarAnnounced = true;
+      this.notify(`🎒 Хотбар загружен.\n${this.describeHotbar()}`).catch(console.error);
+    }, 350);
+  }
+
+  async waitForInventorySync(timeoutMs = 2500) {
+    if (this.hotbarItems().some(Boolean)) return true;
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      await sleep(150);
+      if (this.hotbarItems().some(Boolean)) return true;
+    }
+
+    return false;
   }
 
   async handleWindowOpen(window) {
@@ -192,12 +343,24 @@ class InventoryController {
   }
 
   describeHotbar() {
+    const items = this.hotbarItems();
     const lines = ['🎒 Меню закрыто. Хотбар:'];
+
     for (let index = 0; index < 9; index += 1) {
-      const item = this.bot?.inventory?.slots?.[36 + index];
       const selected = Number(this.bot?.quickBarSlot) === index ? ' ← выбран' : '';
-      lines.push(`${index + 1}: ${itemName(item)}${selected}`);
+      lines.push(`${index + 1}: ${itemName(items[index])}${selected}`);
     }
+
+    if (!items.some(Boolean)) {
+      lines.push(
+        '',
+        `⚠️ Хотбар пока не синхронизирован. Пакетов инвентаря получено: ${this.inventoryPackets}.`,
+        this.inventoryParseErrors
+          ? `Ошибок разбора предметов: ${this.inventoryParseErrors}.`
+          : 'Ошибок разбора предметов нет.'
+      );
+    }
+
     lines.push('', 'Команды: слот 4 | пкм | лкм | меню');
     return lines.join('\n');
   }
@@ -221,6 +384,7 @@ class InventoryController {
     const normalized = text.toLowerCase().replace(/ё/g, 'е');
 
     if (/^(?:меню|слоты|инвентарь|inventory|gui)$/i.test(normalized)) {
+      if (!this.bot?.currentWindow) await this.waitForInventorySync();
       return { handled: true, message: this.describeWindow() };
     }
 
@@ -269,6 +433,8 @@ class InventoryController {
       return this.clickGuiSlot(slot, 0);
     }
 
+    await this.waitForInventorySync(1200);
+
     if (!Number.isInteger(slot) || slot < 1 || slot > 9) {
       return { handled: true, message: 'Без открытого меню номер хотбара должен быть от 1 до 9.' };
     }
@@ -277,7 +443,7 @@ class InventoryController {
     await sleep(120);
     return {
       handled: true,
-      message: `✅ Выбран хотбар ${slot}: ${itemName(this.bot.heldItem)}`
+      message: `✅ Выбран хотбар ${slot}: ${itemName(this.inventoryItem(this.hotbarStart() + slot - 1))}`
     };
   }
 
@@ -353,7 +519,9 @@ class InventoryController {
       return { handled: true, message: 'Меню открыто. Напиши «пкм слот 15», указав номер GUI-слота.' };
     }
 
-    const held = itemName(this.bot.heldItem);
+    await this.waitForInventorySync(1200);
+    const item = this.inventoryItem(this.hotbarStart() + Number(this.bot.quickBarSlot || 0));
+    const held = itemName(item);
     this.bot.activateItem(false);
     setTimeout(() => {
       try { this.bot?.deactivateItem(); } catch {}

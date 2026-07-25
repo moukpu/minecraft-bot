@@ -95,27 +95,55 @@ mineflayer.createBot = function createBotWithFunTimeFixes(options = {}) {
     console.error('[hotbar-fix] Не удалось загрузить prismarine-item:', error.message);
   }
 
+  function applyInventorySlot(slot, rawItem) {
+    if (!Item || !bot.inventory || !Number.isInteger(slot) || slot < 0) return;
+
+    try {
+      const item = Item.fromNotch(rawItem);
+      normalizeItemName(item);
+
+      if (typeof bot._setSlot === 'function') bot._setSlot(slot, item, bot.inventory);
+      else {
+        bot.inventory.updateSlot(slot, item);
+        bot.updateHeldItem?.();
+      }
+    } catch (error) {
+      console.error(`[inventory-fix] Не удалось применить слот ${slot}:`, error.message);
+    }
+  }
+
   bot._client.on('set_slot', packet => {
     try {
       const windowId = normalizeWindowId(packet.windowId);
       const lobbySlot = Number(packet.slot);
       if (windowId !== -2 || !Number.isInteger(lobbySlot) || lobbySlot < 0 || lobbySlot > 8) return;
-      if (!Item || !bot.inventory) return;
 
-      const item = Item.fromNotch(packet.item);
-      normalizeItemName(item);
-      const hotbarStart = Number(bot.QUICK_BAR_START ?? bot.inventory.hotbarStart ?? 36);
+      const hotbarStart = Number(bot.QUICK_BAR_START ?? bot.inventory?.hotbarStart ?? 36);
       const targetSlot = hotbarStart + lobbySlot;
-
-      if (typeof bot._setSlot === 'function') bot._setSlot(targetSlot, item, bot.inventory);
-      else {
-        bot.inventory.updateSlot(targetSlot, item);
-        bot.updateHeldItem?.();
-      }
-
+      applyInventorySlot(targetSlot, packet.item);
       console.log(`[hotbar-fix] set_slot -2:${lobbySlot} -> inventory:${targetSlot}`);
     } catch (error) {
       console.error('[hotbar-fix] Ошибка применения lobby-предмета:', error.message);
+    }
+  });
+
+  // На 1.21.4 FunTime присылает весь инвентарь одним window_items для окна 0.
+  // В массиве из 46 элементов хотбар находится в слотах 36..44.
+  bot._client.on('window_items', packet => {
+    try {
+      const windowId = normalizeWindowId(packet.windowId);
+      const items = Array.isArray(packet.items) ? packet.items : [];
+      if (windowId !== 0 || items.length < 45) return;
+
+      const limit = Math.min(items.length, bot.inventory?.slots?.length || items.length);
+      for (let slot = 0; slot < limit; slot += 1) {
+        applyInventorySlot(slot, items[slot]);
+      }
+
+      bot.updateHeldItem?.();
+      console.log(`[inventory-fix] window_items 0: применено ${limit} слотов`);
+    } catch (error) {
+      console.error('[inventory-fix] Ошибка применения window_items:', error.message);
     }
   });
 

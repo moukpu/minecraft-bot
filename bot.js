@@ -57,9 +57,12 @@ let captchaMapSending = false;
 let captchaWaitTimer = null;
 let lastAuthSentAt = 0;
 let currentWindowSummary = null;
-let systemMessages = [];
-const recentlyForwarded = new Map();
+let rawSystemMessages = [];
+let importantMessages = [];
+let announcedSpawn = false;
+let authorized = false;
 
+const recentlySeen = new Map();
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 const mainKeyboard = Markup.keyboard([
@@ -68,7 +71,7 @@ const mainKeyboard = Markup.keyboard([
   ['⚙️ Сервер', '👤 Ник'],
   ['🔐 Пароль', '📝 Авторизация'],
   ['💬 Написать в чат', '🗺 Капча / карта'],
-  ['📋 Системные сообщения', '❌ Отмена']
+  ['📋 Все системные', '❌ Отмена']
 ]).resize().persistent();
 
 const authKeyboard = Markup.inlineKeyboard([
@@ -82,6 +85,7 @@ const authKeyboard = Markup.inlineKeyboard([
 function cleanText(value) {
   return String(value ?? '')
     .replace(/\u00a7[0-9A-FK-OR]/gi, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -89,70 +93,160 @@ function cleanText(value) {
 function safeReason(reason) {
   if (!reason) return 'Причина не указана';
   if (typeof reason === 'string') return cleanText(reason);
+  return componentText(reason) || 'Неизвестная причина';
+}
+
+function parseJsonString(value) {
+  const text = String(value || '').trim();
+  if (!text || !/^[\[{]/.test(text)) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function flattenComponent(value, depth = 0, seen = new Set()) {
+  if (depth > 12 || value == null) return '';
+
+  if (typeof value === 'string') {
+    const parsed = parseJsonString(value);
+    return parsed == null ? value : flattenComponent(parsed, depth + 1, seen);
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map(item => flattenComponent(item, depth + 1, seen)).join('');
+  if (typeof value !== 'object' || seen.has(value)) return '';
+
+  seen.add(value);
 
   try {
-    const rendered = reason.toString?.();
-    if (rendered && rendered !== '[object Object]') return cleanText(rendered);
-    return cleanText(JSON.stringify(reason));
-  } catch {
-    return 'Неизвестная причина';
+    if (typeof value.toJSON === 'function') {
+      const json = value.toJSON();
+      if (json && json !== value) {
+        const rendered = flattenComponent(json, depth + 1, seen);
+        if (rendered) return rendered;
+      }
+    }
+  } catch {}
+
+  let result = '';
+  if (typeof value.text === 'string') result += value.text;
+
+  for (const key of ['extra', 'with', 'siblings']) {
+    if (Array.isArray(value[key])) {
+      result += value[key].map(item => flattenComponent(item, depth + 1, seen)).join('');
+    }
   }
+
+  if (!result && typeof value.value === 'string') result = value.value;
+
+  if (!result) {
+    try {
+      const rendered = value.toString?.();
+      if (rendered && rendered !== '[object Object]') {
+        const parsed = parseJsonString(rendered);
+        result = parsed == null ? rendered : flattenComponent(parsed, depth + 1, seen);
+      }
+    } catch {}
+  }
+
+  return result;
 }
 
 function componentText(component) {
-  if (component == null) return '';
-  if (typeof component === 'string') return cleanText(component);
-
-  try {
-    const rendered = component.toString?.();
-    if (rendered && rendered !== '[object Object]') return cleanText(rendered);
-  } catch {}
-
-  try {
-    return cleanText(JSON.stringify(component));
-  } catch {
-    return '';
-  }
+  return cleanText(flattenComponent(component));
 }
 
 async function notify(text) {
+  const value = cleanText(text).slice(0, 4000);
+  if (!value) return;
+
   try {
-    await telegram.telegram.sendMessage(
-      ADMIN_ID,
-      cleanText(text).slice(0, 4000),
-      mainKeyboard
-    );
+    await telegram.telegram.sendMessage(ADMIN_ID, value, mainKeyboard);
   } catch (error) {
     console.error('Ошибка Telegram:', error.message);
   }
 }
 
-function rememberSystemMessage(text) {
-  const value = cleanText(text);
-  if (!value) return;
-
-  systemMessages.push({ at: Date.now(), text: value });
-  if (systemMessages.length > 100) systemMessages.shift();
+function normalizeMessage(text) {
+  return cleanText(text)
+    .toLowerCase()
+    .replace(/[╔╗╚╝║═★✾↝⇙⇘⚡*]/g, '')
+    .replace(/[^\p{L}\p{N}/<>]+/gu, ' ')
+    .trim();
 }
 
-async function forwardSystemMessage(text, source = 'Система') {
-  const value = cleanText(text);
-  if (!value) return;
+function isDuplicate(text, ttlMs = 20000) {
+  const key = normalizeMessage(text);
+  if (!key) return true;
 
-  const key = `${source}:${value}`;
   const now = Date.now();
-  const previous = recentlyForwarded.get(key) || 0;
-  if (now - previous < 4000) return;
+  const previous = recentlySeen.get(key) || 0;
+  recentlySeen.set(key, now);
 
-  recentlyForwarded.set(key, now);
-  if (recentlyForwarded.size > 200) {
-    for (const [oldKey, timestamp] of recentlyForwarded) {
-      if (now - timestamp > 60000) recentlyForwarded.delete(oldKey);
+  if (recentlySeen.size > 300) {
+    for (const [oldKey, timestamp] of recentlySeen) {
+      if (now - timestamp > 120000) recentlySeen.delete(oldKey);
     }
   }
 
-  rememberSystemMessage(`${source}: ${value}`);
-  await notify(`🖥 ${source}: ${value}`);
+  return now - previous < ttlMs;
+}
+
+function rememberRaw(source, text) {
+  const value = cleanText(text);
+  if (!value) return;
+
+  rawSystemMessages.push({ at: Date.now(), source, text: value });
+  if (rawSystemMessages.length > 150) rawSystemMessages.shift();
+}
+
+function rememberImportant(text) {
+  const value = cleanText(text);
+  if (!value) return;
+
+  importantMessages.push({ at: Date.now(), text: value });
+  if (importantMessages.length > 40) importantMessages.shift();
+}
+
+function isDecorativeNoise(text) {
+  const value = cleanText(text);
+  if (!value) return true;
+
+  const lettersAndDigits = value.replace(/[^\p{L}\p{N}]/gu, '');
+  if (lettersAndDigits.length <= 1) return true;
+  if (/^[╔╗╚╝║═─━┏┓┗┛★✦✧✾\s]+$/u.test(value)) return true;
+
+  return [
+    /приятной игры/i,
+    /наши социальные сети/i,
+    /привяжите.*(?:вк|телеграм)/i,
+    /\/links\b/i,
+    /\/vk\b/i,
+    /\/tg\b/i,
+    /вы играете на funtime/i,
+    /^добро пожаловать на funtime/i,
+    /^funtime\.su$/i
+  ].some(pattern => pattern.test(value));
+}
+
+function isActionableMessage(text) {
+  const value = cleanText(text);
+  return [
+    /капч|captcha|номер с картинки|проверочн/i,
+    /\/reg(?:ister)?\b|зарегистр/i,
+    /\/login\b|авториз|войдите|выполните вход/i,
+    /успеш|ошиб|неверн|некоррект|недостаточно|запрещ|кик|бан|отключ|тайм.?аут/i,
+    /неизвестн.*команд|команда.*не найдена/i,
+    /выберите|нажмите|используйте|введите|перейдите/i,
+    /телепорт|подключен|перемещен|отправлен/i
+  ].some(pattern => pattern.test(value));
+}
+
+async function forwardImportant(text, source = 'Сервер') {
+  const value = cleanText(text);
+  if (!value || isDecorativeNoise(value) || isDuplicate(value)) return;
+
+  const output = source === 'Сервер' ? value : `${source}: ${value}`;
+  rememberImportant(output);
+  await notify(`🖥 ${output}`);
 }
 
 function playerNames() {
@@ -189,7 +283,6 @@ function isPlayerChatMessage(text, messagePosition, jsonMsg, sender) {
       new RegExp(`^(?:\\[[^\\]]+\\]\\s*)*${escaped}\\s*(?::|»|›|->)\\s*`, 'i'),
       new RegExp(`^${escaped}\\s+(?:говорит|пишет):`, 'i')
     ];
-
     if (patterns.some(pattern => pattern.test(value))) return true;
   }
 
@@ -209,13 +302,21 @@ function windowTitle(window) {
 
 function windowItems(window) {
   const items = [];
+  const used = new Set();
+
   for (let slot = 0; slot < (window?.slots?.length || 0); slot += 1) {
     const item = window.slots[slot];
     if (!item) continue;
+
     const name = cleanText(item.displayName || item.name || 'предмет');
-    items.push(`${slot}: ${name}${item.count > 1 ? ` x${item.count}` : ''}`);
-    if (items.length >= 18) break;
+    const value = `${name}${item.count > 1 ? ` x${item.count}` : ''}`;
+    if (!value || used.has(value)) continue;
+
+    used.add(value);
+    items.push(value);
+    if (items.length >= 8) break;
   }
+
   return items;
 }
 
@@ -224,13 +325,10 @@ function scoreboardText() {
   if (!sidebar) return '';
 
   const title = componentText(sidebar.title || sidebar.name);
-  const items = Array.isArray(sidebar.items)
-    ? sidebar.items
-    : Object.values(sidebar.itemsMap || {});
-
-  const lines = items.slice(-15).map(item => {
+  const items = Array.isArray(sidebar.items) ? sidebar.items : Object.values(sidebar.itemsMap || {});
+  const lines = items.slice(-10).map(item => {
     if (typeof item === 'string') return cleanText(item);
-    return cleanText(item?.displayName || item?.name || item?.value || JSON.stringify(item));
+    return componentText(item?.displayName || item?.name || item?.value || item);
   }).filter(Boolean);
 
   if (!title && !lines.length) return '';
@@ -242,9 +340,7 @@ function worldStateText() {
     minecraft ? '🟢 Minecraft подключён' : '🔴 Minecraft отключён',
     `Состояние: ${connectionState}`,
     `Сервер: ${config.host || 'не задан'}:${config.port}`,
-    `Ник: ${config.username || 'не задан'}`,
-    `Версия: ${config.version || 'авто'}`,
-    `Авторизация: ${authModeLabel()}`
+    `Ник: ${config.username || 'не задан'}`
   ];
 
   if (minecraft?.entity?.position) {
@@ -254,17 +350,15 @@ function worldStateText() {
   }
 
   if (currentWindowSummary) {
-    lines.push(`Открыто меню: ${currentWindowSummary.title}`);
-    if (currentWindowSummary.items.length) {
-      lines.push(`Предметы: ${currentWindowSummary.items.slice(0, 8).join(', ')}`);
-    }
+    lines.push(`Меню: ${currentWindowSummary.title}`);
+    if (currentWindowSummary.items.length) lines.push(`Предметы: ${currentWindowSummary.items.join(', ')}`);
   }
 
   const scoreboard = scoreboardText();
   if (scoreboard) lines.push(scoreboard);
 
-  const latest = systemMessages.slice(-8).map(entry => entry.text);
-  if (latest.length) lines.push(`Последние системные сообщения:\n${latest.join('\n')}`);
+  const last = importantMessages.at(-1)?.text;
+  if (last) lines.push(`Последнее важное: ${last}`);
 
   return lines.join('\n').slice(0, 3900);
 }
@@ -289,9 +383,7 @@ async function sendCaptchaMap(target, automatic = false) {
 
   const photo = { source: image, filename: 'minecraft-captcha.png' };
   const options = {
-    caption: automatic
-      ? '🧩 Капча. Просто отправь цифры сообщением.'
-      : '🗺 Последняя карта, которую реально прислал сервер.',
+    caption: automatic ? '🧩 Капча. Просто отправь цифры сообщением.' : '🗺 Последняя карта сервера.',
     reply_markup: mainKeyboard.reply_markup
   };
 
@@ -314,9 +406,7 @@ async function waitAndSendCaptchaMap() {
       await sleep(500);
     }
 
-    if (!captchaMapSent) {
-      await forwardSystemMessage('Капча запрошена, но изображение пока не собралось.', 'Бот');
-    }
+    if (!captchaMapSent) await forwardImportant('Капча запрошена, но изображение пока не собралось.', 'Бот');
   } catch (error) {
     console.error('Не удалось отправить капчу:', error);
   } finally {
@@ -353,28 +443,63 @@ function sendStoredAuth(mode = config.authMode) {
   return true;
 }
 
-function inspectSystemInstruction(text) {
-  if (/капч|captcha|введите код|номер с картинки|проверочн/i.test(text)) {
+function classifySystemMessage(text) {
+  const value = cleanText(text);
+
+  if (/капч|captcha|номер с картинки|проверочн/i.test(value)) return 'captcha';
+  if (/успешн.*регистрац|регистрац.*успеш/i.test(value)) return 'registered';
+  if (/успешн.*(?:вход|авториз)|авторизац.*успеш|вы вошли/i.test(value)) return 'logged-in';
+  if (/\/reg(?:ister)?\b|зарегистрируй|регистрац/i.test(value)) return 'register';
+  if (/\/login\b|авториз|войдите|выполните вход/i.test(value)) return 'login';
+  return 'other';
+}
+
+async function processSystemMessage(text, source = 'Сервер') {
+  const value = cleanText(text);
+  if (!value) return;
+
+  rememberRaw(source, value);
+  const kind = classifySystemMessage(value);
+
+  if (kind === 'captcha') {
     connectionState = 'Ожидается ответ капчи';
     captchaActive = true;
     scheduleCaptchaMap();
     return;
   }
 
-  if (/\/register|зарегистрируй|регистрац/i.test(text)) {
+  if (kind === 'registered') {
+    authorized = true;
+    captchaActive = false;
+    connectionState = 'Зарегистрирован / в лобби';
+    await forwardImportant('Успешная регистрация. Бот в лобби.');
+    return;
+  }
+
+  if (kind === 'logged-in') {
+    authorized = true;
+    captchaActive = false;
+    connectionState = 'Авторизован / в лобби';
+    await forwardImportant('Вход выполнен. Бот в лобби.');
+    return;
+  }
+
+  if (kind === 'register') {
     connectionState = 'Сервер требует регистрацию';
+    await forwardImportant('Требуется регистрация: /reg <пароль>');
     if (config.authMode === 'register') sendStoredAuth('register');
     return;
   }
 
-  if (/\/login|авториз|войдите|выполните вход/i.test(text)) {
+  if (kind === 'login') {
     connectionState = 'Сервер требует вход';
+    await forwardImportant('Требуется вход: /login <пароль>');
     if (config.authMode === 'login') sendStoredAuth('login');
     return;
   }
 
-  if (/успешно.*(?:вош|авториз|зарегистр)|авторизац.*успеш|регистрац.*успеш|добро пожаловать|вы вошли/i.test(text)) {
-    connectionState = 'Авторизован / в лобби';
+  if (!isDecorativeNoise(value) && isActionableMessage(value)) {
+    await forwardImportant(value, source);
   }
 }
 
@@ -395,9 +520,12 @@ function connectMinecraft() {
   reconnectEnabled = true;
   connectionState = 'Подключение';
   currentWindowSummary = null;
-  systemMessages = [];
-  recentlyForwarded.clear();
+  rawSystemMessages = [];
+  importantMessages = [];
+  recentlySeen.clear();
   lastAuthSentAt = 0;
+  announcedSpawn = false;
+  authorized = false;
   resetCaptchaState();
 
   const options = {
@@ -415,12 +543,16 @@ function connectMinecraft() {
 
   current.once('login', () => {
     connectionState = 'Соединение установлено, жду сервер';
-    notify(`🔌 Подключился к ${config.host}:${config.port}. Жду системные сообщения.`);
+    notify(`🔌 Подключился к ${config.host}:${config.port}.`);
   });
 
   current.on('spawn', () => {
-    connectionState = 'Мир загружен, жду указания сервера';
-    notify(`✅ Мир загружен под ником ${config.username}. Это ещё не означает, что вход или регистрация завершены.`);
+    if (!announcedSpawn) {
+      announcedSpawn = true;
+      if (!authorized && !/требует|капч/i.test(connectionState)) {
+        connectionState = 'Мир загружен, жду указания сервера';
+      }
+    }
   });
 
   current.on('messagestr', (message, messagePosition, jsonMsg, sender) => {
@@ -433,18 +565,19 @@ function connectMinecraft() {
     }
 
     console.log('[SYSTEM]', text);
-    forwardSystemMessage(text, 'Minecraft');
-    inspectSystemInstruction(text);
+    processSystemMessage(text, 'Сервер').catch(console.error);
   });
 
   current.on('title', (title, type) => {
     const text = componentText(title);
-    if (text) forwardSystemMessage(text, type ? `Заголовок ${type}` : 'Заголовок');
+    if (!text) return;
+    processSystemMessage(text, type === 'subtitle' ? 'Подсказка' : 'Заголовок').catch(console.error);
   });
 
   current.on('actionBar', jsonMsg => {
     const text = componentText(jsonMsg);
-    if (text) forwardSystemMessage(text, 'ActionBar');
+    if (!text) return;
+    processSystemMessage(text, 'ActionBar').catch(console.error);
   });
 
   current.on('windowOpen', window => {
@@ -454,19 +587,13 @@ function connectMinecraft() {
     };
 
     const details = currentWindowSummary.items.length
-      ? `\n${currentWindowSummary.items.join('\n')}`
-      : '\nВ меню пока нет видимых предметов.';
+      ? `: ${currentWindowSummary.items.join(', ')}`
+      : '';
 
-    forwardSystemMessage(
-      `Открыто меню: ${currentWindowSummary.title}${details}`,
-      'Интерфейс'
-    );
+    forwardImportant(`Открыто меню «${currentWindowSummary.title}»${details}`, 'Интерфейс').catch(console.error);
   });
 
   current.on('windowClose', () => {
-    if (currentWindowSummary) {
-      forwardSystemMessage(`Закрыто меню: ${currentWindowSummary.title}`, 'Интерфейс');
-    }
     currentWindowSummary = null;
   });
 
@@ -537,8 +664,15 @@ async function showMain(ctx, text = '🤖 Управление Minecraft-бот�
 
 async function sendToMinecraft(ctx, text) {
   if (!minecraft) return ctx.reply('Minecraft сейчас не подключён.', mainKeyboard);
+
   minecraft.chat(text);
-  return ctx.reply(`📤 Отправлено в Minecraft: ${text}`, mainKeyboard);
+
+  if (/^\/(?:reg(?:ister)?|login)\b/i.test(text)) {
+    try { await ctx.deleteMessage(); } catch {}
+    return ctx.reply('📤 Команда авторизации отправлена в Minecraft.', mainKeyboard);
+  }
+
+  return ctx.reply('📤 Отправлено в Minecraft.', mainKeyboard);
 }
 
 telegram.use(async (ctx, next) => {
@@ -629,13 +763,13 @@ telegram.action('auth_manual', async ctx => {
   config.authMode = 'manual';
   saveConfig();
   await ctx.answerCbQuery('Ручной режим');
-  await ctx.editMessageText('✅ Автоматическая авторизация выключена. Любую команду можно писать прямо в чат Telegram.');
+  await ctx.editMessageText('✅ Автоматическая авторизация выключена. Команды можно писать прямо в Telegram.');
   await showMain(ctx, 'Ручной режим сохранён.');
 });
 
 telegram.hears('💬 Написать в чат', ctx => {
   pendingAction = 'chat';
-  return ctx.reply('Отправь текст или команду. Вообще-то теперь можно писать их сразу, без этой кнопки.', mainKeyboard);
+  return ctx.reply('Отправь текст или команду. Можно писать и сразу, без этой кнопки.', mainKeyboard);
 });
 
 telegram.hears('🗺 Капча / карта', ctx => {
@@ -643,13 +777,17 @@ telegram.hears('🗺 Капча / карта', ctx => {
   return sendCaptchaMap(ctx, false);
 });
 
-telegram.hears('📋 Системные сообщения', ctx => {
+telegram.hears('📋 Все системные', ctx => {
   pendingAction = null;
-  const latest = systemMessages.slice(-30);
+  const latest = rawSystemMessages.slice(-40);
   if (!latest.length) return ctx.reply('Системных сообщений пока нет.', mainKeyboard);
 
-  const text = latest.map((entry, index) => `${index + 1}. ${entry.text}`).join('\n').slice(0, 3900);
-  return ctx.reply(`📋 Последние системные сообщения:\n\n${text}`, mainKeyboard);
+  const text = latest
+    .map((entry, index) => `${index + 1}. ${entry.source}: ${entry.text}`)
+    .join('\n')
+    .slice(0, 3900);
+
+  return ctx.reply(`📋 Полный сырой журнал:\n\n${text}`, mainKeyboard);
 });
 
 telegram.hears('❌ Отмена', ctx => {
@@ -666,12 +804,10 @@ telegram.on('text', async ctx => {
     minecraft.chat(text);
     captchaActive = false;
     connectionState = 'Ответ капчи отправлен, жду сервер';
-    return ctx.reply('📤 Ответ капчи отправлен. Теперь системные сообщения сервера придут сюда.', mainKeyboard);
+    return ctx.reply('📤 Ответ капчи отправлен.', mainKeyboard);
   }
 
-  if (!pendingAction) {
-    return sendToMinecraft(ctx, text);
-  }
+  if (!pendingAction) return sendToMinecraft(ctx, text);
 
   const action = pendingAction;
   pendingAction = null;

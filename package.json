@@ -1,21 +1,24 @@
 {
   "name": "minecraft-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Minecraft Mineflayer bot controlled from Telegram",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "check": "node --check bot.js"
+    "check": "node --check bot.js && node --check screen-service.js && node --check map-capture.js"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
-    "@aresrpg/aresrpg-map-colors": "latest",
+    "@aresrpg/aresrpg-map-colors": "3.1.0",
+    "@sparticuz/chromium": "149.0.0",
     "dotenv": "latest",
     "mineflayer": "latest",
-    "pngjs": "latest",
+    "pngjs": "7.0.0",
+    "prismarine-viewer": "latest",
+    "puppeteer-core": "25.3.0",
     "telegraf": "latest"
   }
 }

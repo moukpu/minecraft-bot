@@ -7,6 +7,7 @@ const path = require('path');
 const mineflayer = require('mineflayer');
 const { Telegraf, Markup } = require('telegraf');
 const { MapCapture } = require('./map-capture');
+const { InventoryController } = require('./inventory-controller');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -56,7 +57,6 @@ let captchaMapSent = false;
 let captchaMapSending = false;
 let captchaWaitTimer = null;
 let lastAuthSentAt = 0;
-let currentWindowSummary = null;
 let rawSystemMessages = [];
 let importantMessages = [];
 let announcedSpawn = false;
@@ -68,10 +68,11 @@ const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 const mainKeyboard = Markup.keyboard([
   ['▶️ Подключить', '⏹ Отключить'],
   ['📊 Что происходит', '🔄 Перезайти'],
+  ['🎒 Меню / слоты', '🎮 Управление'],
   ['⚙️ Сервер', '👤 Ник'],
   ['🔐 Пароль', '📝 Авторизация'],
-  ['💬 Написать в чат', '🗺 Капча / карта'],
-  ['📋 Все системные', '❌ Отмена']
+  ['🗺 Капча / карта', '📋 Все системные'],
+  ['❌ Отмена']
 ]).resize().persistent();
 
 const authKeyboard = Markup.inlineKeyboard([
@@ -88,12 +89,6 @@ function cleanText(value) {
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function safeReason(reason) {
-  if (!reason) return 'Причина не указана';
-  if (typeof reason === 'string') return cleanText(reason);
-  return componentText(reason) || 'Неизвестная причина';
 }
 
 function parseJsonString(value) {
@@ -154,6 +149,12 @@ function componentText(component) {
   return cleanText(flattenComponent(component));
 }
 
+function safeReason(reason) {
+  if (!reason) return 'Причина не указана';
+  if (typeof reason === 'string') return cleanText(reason);
+  return componentText(reason) || 'Неизвестная причина';
+}
+
 async function notify(text) {
   const value = cleanText(text).slice(0, 4000);
   if (!value) return;
@@ -164,6 +165,15 @@ async function notify(text) {
     console.error('Ошибка Telegram:', error.message);
   }
 }
+
+const inventoryController = new InventoryController({
+  notify,
+  onState: state => {
+    connectionState = authorized && state === 'Мир загружен'
+      ? 'Авторизован / мир загружен'
+      : state;
+  }
+});
 
 function normalizeMessage(text) {
   return cleanText(text)
@@ -193,7 +203,6 @@ function isDuplicate(text, ttlMs = 20000) {
 function rememberRaw(source, text) {
   const value = cleanText(text);
   if (!value) return;
-
   rawSystemMessages.push({ at: Date.now(), source, text: value });
   if (rawSystemMessages.length > 150) rawSystemMessages.shift();
 }
@@ -201,7 +210,6 @@ function rememberRaw(source, text) {
 function rememberImportant(text) {
   const value = cleanText(text);
   if (!value) return;
-
   importantMessages.push({ at: Date.now(), text: value });
   if (importantMessages.length > 40) importantMessages.shift();
 }
@@ -236,7 +244,7 @@ function isActionableMessage(text) {
     /успеш|ошиб|неверн|некоррект|недостаточно|запрещ|кик|бан|отключ|тайм.?аут/i,
     /неизвестн.*команд|команда.*не найдена/i,
     /выберите|нажмите|используйте|введите|перейдите/i,
-    /телепорт|подключен|перемещен|отправлен/i
+    /телепорт|подключен|перемещен|отправлен|загруз/i
   ].some(pattern => pattern.test(value));
 }
 
@@ -296,30 +304,6 @@ function authModeLabel() {
   return 'вручную';
 }
 
-function windowTitle(window) {
-  return componentText(window?.title) || cleanText(window?.type) || 'без названия';
-}
-
-function windowItems(window) {
-  const items = [];
-  const used = new Set();
-
-  for (let slot = 0; slot < (window?.slots?.length || 0); slot += 1) {
-    const item = window.slots[slot];
-    if (!item) continue;
-
-    const name = cleanText(item.displayName || item.name || 'предмет');
-    const value = `${name}${item.count > 1 ? ` x${item.count}` : ''}`;
-    if (!value || used.has(value)) continue;
-
-    used.add(value);
-    items.push(value);
-    if (items.length >= 8) break;
-  }
-
-  return items;
-}
-
 function scoreboardText() {
   const sidebar = minecraft?.scoreboard?.sidebar;
   if (!sidebar) return '';
@@ -344,14 +328,16 @@ function worldStateText() {
   ];
 
   if (minecraft?.entity?.position) {
-    const p = minecraft.entity.position;
-    lines.push(`XYZ: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`);
+    const position = minecraft.entity.position;
+    lines.push(`XYZ: ${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)}`);
     lines.push(`HP: ${minecraft.health ?? '?'} | Еда: ${minecraft.food ?? '?'}`);
   }
 
-  if (currentWindowSummary) {
-    lines.push(`Меню: ${currentWindowSummary.title}`);
-    if (currentWindowSummary.items.length) lines.push(`Предметы: ${currentWindowSummary.items.join(', ')}`);
+  if (minecraft?.currentWindow) {
+    lines.push(`Меню: ${inventoryController.windowTitle(minecraft.currentWindow)}`);
+    lines.push('Пиши «меню», чтобы увидеть номера занятых слотов.');
+  } else {
+    lines.push(`Хотбар: ${Number(minecraft?.quickBarSlot ?? 0) + 1}`);
   }
 
   const scoreboard = scoreboardText();
@@ -519,7 +505,6 @@ function connectMinecraft() {
 
   reconnectEnabled = true;
   connectionState = 'Подключение';
-  currentWindowSummary = null;
   rawSystemMessages = [];
   importantMessages = [];
   recentlySeen.clear();
@@ -540,6 +525,7 @@ function connectMinecraft() {
   const current = mineflayer.createBot(options);
   minecraft = current;
   mapCapture.attach(current);
+  inventoryController.attach(current);
 
   current.once('login', () => {
     connectionState = 'Соединение установлено, жду сервер';
@@ -549,7 +535,7 @@ function connectMinecraft() {
   current.on('spawn', () => {
     if (!announcedSpawn) {
       announcedSpawn = true;
-      if (!authorized && !/требует|капч/i.test(connectionState)) {
+      if (!authorized && !/требует|капч|загрузк/i.test(connectionState)) {
         connectionState = 'Мир загружен, жду указания сервера';
       }
     }
@@ -580,23 +566,6 @@ function connectMinecraft() {
     processSystemMessage(text, 'ActionBar').catch(console.error);
   });
 
-  current.on('windowOpen', window => {
-    currentWindowSummary = {
-      title: windowTitle(window),
-      items: windowItems(window)
-    };
-
-    const details = currentWindowSummary.items.length
-      ? `: ${currentWindowSummary.items.join(', ')}`
-      : '';
-
-    forwardImportant(`Открыто меню «${currentWindowSummary.title}»${details}`, 'Интерфейс').catch(console.error);
-  });
-
-  current.on('windowClose', () => {
-    currentWindowSummary = null;
-  });
-
   current.on('death', () => {
     connectionState = 'Умер, ожидает возрождение';
     notify('☠️ Бот умер.');
@@ -616,7 +585,7 @@ function connectMinecraft() {
     connectionState = `Отключён: ${text}`;
     if (minecraft === current) minecraft = null;
     mapCapture.detach();
-    currentWindowSummary = null;
+    inventoryController.detach();
     resetCaptchaState();
     notify(`🔌 Minecraft отключён:\n${text}`);
     scheduleReconnect();
@@ -639,8 +608,8 @@ function disconnectMinecraft(manual = true) {
   const current = minecraft;
   minecraft = null;
   connectionState = 'Отключён вручную';
-  currentWindowSummary = null;
   mapCapture.detach();
+  inventoryController.detach();
   try { current.quit('Отключение через Telegram'); } catch {}
 }
 
@@ -652,6 +621,7 @@ function reconnectMinecraft() {
     const current = minecraft;
     minecraft = null;
     mapCapture.detach();
+    inventoryController.detach();
     try { current.quit('Переподключение'); } catch {}
   }
 
@@ -675,6 +645,13 @@ async function sendToMinecraft(ctx, text) {
   return ctx.reply('📤 Отправлено в Minecraft.', mainKeyboard);
 }
 
+async function processDirectControl(ctx, text) {
+  const result = await inventoryController.handleCommand(text);
+  if (!result.handled) return false;
+  await ctx.reply(result.message, mainKeyboard);
+  return true;
+}
+
 telegram.use(async (ctx, next) => {
   if (String(ctx.from?.id || '') !== ADMIN_ID) {
     if (ctx.chat) await ctx.reply('⛔ Нет доступа.');
@@ -687,6 +664,7 @@ telegram.start(ctx => showMain(ctx));
 telegram.command('menu', ctx => showMain(ctx));
 telegram.command('status', ctx => ctx.reply(worldStateText(), mainKeyboard));
 telegram.command('screen', ctx => ctx.reply(worldStateText(), mainKeyboard));
+telegram.command('inventory', ctx => ctx.reply(inventoryController.describeWindow(), mainKeyboard));
 telegram.command('connect', ctx => {
   const started = connectMinecraft();
   return ctx.reply(started ? '🔄 Подключаюсь...' : 'Бот уже подключён или не заданы сервер/ник.', mainKeyboard);
@@ -715,6 +693,8 @@ telegram.hears('⏹ Отключить', ctx => {
 });
 
 telegram.hears('📊 Что происходит', ctx => ctx.reply(worldStateText(), mainKeyboard));
+telegram.hears('🎒 Меню / слоты', ctx => ctx.reply(inventoryController.describeWindow(), mainKeyboard));
+telegram.hears('🎮 Управление', ctx => ctx.reply(inventoryController.helpText(), mainKeyboard));
 
 telegram.hears('🔄 Перезайти', ctx => {
   pendingAction = null;
@@ -767,11 +747,6 @@ telegram.action('auth_manual', async ctx => {
   await showMain(ctx, 'Ручной режим сохранён.');
 });
 
-telegram.hears('💬 Написать в чат', ctx => {
-  pendingAction = 'chat';
-  return ctx.reply('Отправь текст или команду. Можно писать и сразу, без этой кнопки.', mainKeyboard);
-});
-
 telegram.hears('🗺 Капча / карта', ctx => {
   pendingAction = null;
   return sendCaptchaMap(ctx, false);
@@ -807,7 +782,10 @@ telegram.on('text', async ctx => {
     return ctx.reply('📤 Ответ капчи отправлен.', mainKeyboard);
   }
 
-  if (!pendingAction) return sendToMinecraft(ctx, text);
+  if (!pendingAction) {
+    if (await processDirectControl(ctx, text)) return;
+    return sendToMinecraft(ctx, text);
+  }
 
   const action = pendingAction;
   pendingAction = null;
@@ -846,8 +824,6 @@ telegram.on('text', async ctx => {
     try { await ctx.deleteMessage(); } catch {}
     return ctx.reply('✅ Пароль сохранён. Сообщение с паролем удалено.', mainKeyboard);
   }
-
-  if (action === 'chat') return sendToMinecraft(ctx, text);
 });
 
 telegram.catch(error => {
@@ -859,6 +835,7 @@ async function shutdown(signal) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   resetCaptchaState();
   mapCapture.detach();
+  inventoryController.detach();
 
   if (minecraft) {
     try { minecraft.quit('Перезапуск процесса'); } catch {}

@@ -1,0 +1,51 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minecraft-bot-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64, minecraft-bot]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check JavaScript syntax
+        run: npm run check
+
+      - name: Deploy files
+        run: |
+          mkdir -p /home/ubuntu/minecraft-bot
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.env' \
+            --exclude='config.json' \
+            --exclude='node_modules/' \
+            "$GITHUB_WORKSPACE/" /home/ubuntu/minecraft-bot/
+
+      - name: Install production dependencies
+        working-directory: /home/ubuntu/minecraft-bot
+        run: npm install --omit=dev --no-audit --no-fund
+
+      - name: Restart bot
+        working-directory: /home/ubuntu/minecraft-bot
+        run: |
+          if pm2 describe minecraft-bot >/dev/null 2>&1; then
+            pm2 restart minecraft-bot --update-env
+          else
+            pm2 start bot.js --name minecraft-bot
+          fi
+          pm2 save
+
+      - name: Show status
+        run: pm2 status minecraft-bot

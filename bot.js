@@ -49,6 +49,9 @@ const mapCapture = new MapCapture();
 
 let minecraft = null;
 let connectionState = 'Отключён';
+let authState = 'unknown';
+let lastAuthAttemptAt = 0;
+let pendingAuthType = null;
 let reconnectTimer = null;
 let reconnectEnabled = false;
 let pendingAction = null;
@@ -58,9 +61,8 @@ let captchaMapSending = false;
 let captchaWaitTimer = null;
 let lastAuthSentAt = 0;
 let rawSystemMessages = [];
-let importantMessages = [];
+let relayedSystemMessages = [];
 let announcedSpawn = false;
-let authorized = false;
 
 const recentlySeen = new Map();
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -169,7 +171,7 @@ async function notify(text) {
 const inventoryController = new InventoryController({
   notify,
   onState: state => {
-    connectionState = authorized && state === 'Мир загружен'
+    connectionState = authState === 'authenticated' && state === 'Мир загружен'
       ? 'Авторизован / мир загружен'
       : state;
   }
@@ -183,7 +185,7 @@ function normalizeMessage(text) {
     .trim();
 }
 
-function isDuplicate(text, ttlMs = 20000) {
+function isDuplicate(text, ttlMs = 2500) {
   const key = normalizeMessage(text);
   if (!key) return true;
 
@@ -204,56 +206,25 @@ function rememberRaw(source, text) {
   const value = cleanText(text);
   if (!value) return;
   rawSystemMessages.push({ at: Date.now(), source, text: value });
-  if (rawSystemMessages.length > 150) rawSystemMessages.shift();
+  if (rawSystemMessages.length > 200) rawSystemMessages.shift();
 }
 
-function rememberImportant(text) {
+function rememberRelayed(source, text) {
   const value = cleanText(text);
   if (!value) return;
-  importantMessages.push({ at: Date.now(), text: value });
-  if (importantMessages.length > 40) importantMessages.shift();
+  relayedSystemMessages.push({ at: Date.now(), source, text: value });
+  if (relayedSystemMessages.length > 80) relayedSystemMessages.shift();
 }
 
-function isDecorativeNoise(text) {
+async function relaySystemMessage(text, source = 'Сервер') {
   const value = cleanText(text);
-  if (!value) return true;
+  if (!value) return;
 
-  const lettersAndDigits = value.replace(/[^\p{L}\p{N}]/gu, '');
-  if (lettersAndDigits.length <= 1) return true;
-  if (/^[╔╗╚╝║═─━┏┓┗┛★✦✧✾\s]+$/u.test(value)) return true;
+  rememberRaw(source, value);
+  if (isDuplicate(value)) return;
 
-  return [
-    /приятной игры/i,
-    /наши социальные сети/i,
-    /привяжите.*(?:вк|телеграм)/i,
-    /\/links\b/i,
-    /\/vk\b/i,
-    /\/tg\b/i,
-    /вы играете на funtime/i,
-    /^добро пожаловать на funtime/i,
-    /^funtime\.su$/i
-  ].some(pattern => pattern.test(value));
-}
-
-function isActionableMessage(text) {
-  const value = cleanText(text);
-  return [
-    /капч|captcha|номер с картинки|проверочн/i,
-    /\/reg(?:ister)?\b|зарегистр/i,
-    /\/login\b|авториз|войдите|выполните вход/i,
-    /успеш|ошиб|неверн|некоррект|недостаточно|запрещ|кик|бан|отключ|тайм.?аут/i,
-    /неизвестн.*команд|команда.*не найдена/i,
-    /выберите|нажмите|используйте|введите|перейдите/i,
-    /телепорт|подключен|перемещен|отправлен|загруз/i
-  ].some(pattern => pattern.test(value));
-}
-
-async function forwardImportant(text, source = 'Сервер') {
-  const value = cleanText(text);
-  if (!value || isDecorativeNoise(value) || isDuplicate(value)) return;
-
+  rememberRelayed(source, value);
   const output = source === 'Сервер' ? value : `${source}: ${value}`;
-  rememberImportant(output);
   await notify(`🖥 ${output}`);
 }
 
@@ -304,6 +275,16 @@ function authModeLabel() {
   return 'вручную';
 }
 
+function authStateLabel() {
+  if (authState === 'captcha') return 'нужно пройти капчу';
+  if (authState === 'register-required') return 'сервер требует /reg';
+  if (authState === 'login-required') return 'сервер требует /login';
+  if (authState === 'awaiting-register') return 'команда /reg отправлена, жду ответ';
+  if (authState === 'awaiting-login') return 'команда /login отправлена, жду ответ';
+  if (authState === 'authenticated') return 'вход подтверждён сервером';
+  return 'не определена';
+}
+
 function scoreboardText() {
   const sidebar = minecraft?.scoreboard?.sidebar;
   if (!sidebar) return '';
@@ -323,6 +304,7 @@ function worldStateText() {
   const lines = [
     minecraft ? '🟢 Minecraft подключён' : '🔴 Minecraft отключён',
     `Состояние: ${connectionState}`,
+    `Авторизация на сервере: ${authStateLabel()}`,
     `Сервер: ${config.host || 'не задан'}:${config.port}`,
     `Ник: ${config.username || 'не задан'}`
   ];
@@ -343,8 +325,11 @@ function worldStateText() {
   const scoreboard = scoreboardText();
   if (scoreboard) lines.push(scoreboard);
 
-  const last = importantMessages.at(-1)?.text;
-  if (last) lines.push(`Последнее важное: ${last}`);
+  const last = relayedSystemMessages.at(-1);
+  if (last) {
+    const prefix = last.source === 'Сервер' ? '' : `${last.source}: `;
+    lines.push(`Последнее сообщение сервера: ${prefix}${last.text}`);
+  }
 
   return lines.join('\n').slice(0, 3900);
 }
@@ -392,7 +377,7 @@ async function waitAndSendCaptchaMap() {
       await sleep(500);
     }
 
-    if (!captchaMapSent) await forwardImportant('Капча запрошена, но изображение пока не собралось.', 'Бот');
+    if (!captchaMapSent) await notify('⚠️ Капча запрошена, но изображение пока не собралось.');
   } catch (error) {
     console.error('Не удалось отправить капчу:', error);
   } finally {
@@ -415,6 +400,15 @@ function authCommand(mode = config.authMode) {
   return null;
 }
 
+function markAuthAttempt(mode) {
+  lastAuthAttemptAt = Date.now();
+  pendingAuthType = mode;
+  authState = mode === 'register' ? 'awaiting-register' : 'awaiting-login';
+  connectionState = mode === 'register'
+    ? 'Команда регистрации отправлена, жду сервер'
+    : 'Команда входа отправлена, жду сервер';
+}
+
 function sendStoredAuth(mode = config.authMode) {
   if (!minecraft) return false;
   const command = authCommand(mode);
@@ -424,6 +418,7 @@ function sendStoredAuth(mode = config.authMode) {
   if (now - lastAuthSentAt < 3000) return false;
 
   lastAuthSentAt = now;
+  markAuthAttempt(mode);
   minecraft.chat(command);
   notify(`📤 Автоматически отправлено ${mode === 'register' ? '/register' : '/login'}.`);
   return true;
@@ -433,59 +428,72 @@ function classifySystemMessage(text) {
   const value = cleanText(text);
 
   if (/капч|captcha|номер с картинки|проверочн/i.test(value)) return 'captcha';
-  if (/успешн.*регистрац|регистрац.*успеш/i.test(value)) return 'registered';
-  if (/успешн.*(?:вход|авториз)|авторизац.*успеш|вы вошли/i.test(value)) return 'logged-in';
-  if (/\/reg(?:ister)?\b|зарегистрируй|регистрац/i.test(value)) return 'register';
-  if (/\/login\b|авториз|войдите|выполните вход/i.test(value)) return 'login';
+  if (/(?:успешн\w*\s+регистрац|регистрац\w*.*(?:успешн|заверш))/i.test(value)) return 'registered';
+  if (/(?:успешн\w*.*(?:вход|авторизац)|(?:вход|авторизац)\w*.*(?:выполнен|успешн)|вы\s+успешно\s+вошли)/i.test(value)) return 'logged-in';
+  if (/\/reg(?:ister)?(?:\s|$)|зарегистрируйтесь|требуется\s+регистрац/i.test(value)) return 'register';
+  if (/\/login(?:\s|$)|авторизуйтесь|войдите|требуется\s+вход|выполните\s+вход/i.test(value)) return 'login';
   return 'other';
+}
+
+function canConfirmAuth(kind) {
+  const recentAttempt = Date.now() - lastAuthAttemptAt < 60000;
+  if (kind === 'registered') {
+    return recentAttempt && pendingAuthType === 'register' || authState === 'register-required' || authState === 'awaiting-register';
+  }
+  if (kind === 'logged-in') {
+    return recentAttempt && pendingAuthType === 'login' || authState === 'login-required' || authState === 'awaiting-login';
+  }
+  return false;
 }
 
 async function processSystemMessage(text, source = 'Сервер') {
   const value = cleanText(text);
   if (!value) return;
 
-  rememberRaw(source, value);
+  await relaySystemMessage(value, source);
   const kind = classifySystemMessage(value);
 
   if (kind === 'captcha') {
+    authState = 'captcha';
     connectionState = 'Ожидается ответ капчи';
     captchaActive = true;
     scheduleCaptchaMap();
     return;
   }
 
-  if (kind === 'registered') {
-    authorized = true;
-    captchaActive = false;
-    connectionState = 'Зарегистрирован / в лобби';
-    await forwardImportant('Успешная регистрация. Бот в лобби.');
-    return;
-  }
-
-  if (kind === 'logged-in') {
-    authorized = true;
-    captchaActive = false;
-    connectionState = 'Авторизован / в лобби';
-    await forwardImportant('Вход выполнен. Бот в лобби.');
-    return;
-  }
-
   if (kind === 'register') {
+    authState = 'register-required';
+    pendingAuthType = 'register';
     connectionState = 'Сервер требует регистрацию';
-    await forwardImportant('Требуется регистрация: /reg <пароль>');
     if (config.authMode === 'register') sendStoredAuth('register');
     return;
   }
 
   if (kind === 'login') {
+    authState = 'login-required';
+    pendingAuthType = 'login';
     connectionState = 'Сервер требует вход';
-    await forwardImportant('Требуется вход: /login <пароль>');
     if (config.authMode === 'login') sendStoredAuth('login');
     return;
   }
 
-  if (!isDecorativeNoise(value) && isActionableMessage(value)) {
-    await forwardImportant(value, source);
+  if (kind === 'registered') {
+    if (canConfirmAuth(kind)) {
+      authState = 'authenticated';
+      pendingAuthType = null;
+      captchaActive = false;
+      connectionState = 'Регистрация подтверждена / в лобби';
+    }
+    return;
+  }
+
+  if (kind === 'logged-in') {
+    if (canConfirmAuth(kind)) {
+      authState = 'authenticated';
+      pendingAuthType = null;
+      captchaActive = false;
+      connectionState = 'Вход подтверждён / в лобби';
+    }
   }
 }
 
@@ -505,12 +513,14 @@ function connectMinecraft() {
 
   reconnectEnabled = true;
   connectionState = 'Подключение';
+  authState = 'unknown';
+  lastAuthAttemptAt = 0;
+  pendingAuthType = null;
   rawSystemMessages = [];
-  importantMessages = [];
+  relayedSystemMessages = [];
   recentlySeen.clear();
   lastAuthSentAt = 0;
   announcedSpawn = false;
-  authorized = false;
   resetCaptchaState();
 
   const options = {
@@ -528,16 +538,16 @@ function connectMinecraft() {
   inventoryController.attach(current);
 
   current.once('login', () => {
-    connectionState = 'Соединение установлено, жду сервер';
+    if (connectionState === 'Подключение') {
+      connectionState = 'Сетевое соединение установлено, жду сервер';
+    }
     notify(`🔌 Подключился к ${config.host}:${config.port}.`);
   });
 
   current.on('spawn', () => {
-    if (!announcedSpawn) {
-      announcedSpawn = true;
-      if (!authorized && !/требует|капч|загрузк/i.test(connectionState)) {
-        connectionState = 'Мир загружен, жду указания сервера';
-      }
+    if (!announcedSpawn) announcedSpawn = true;
+    if (authState === 'unknown' && !/загрузк/i.test(connectionState)) {
+      connectionState = 'Мир загружен, статус входа пока неизвестен';
     }
   });
 
@@ -583,6 +593,7 @@ function connectMinecraft() {
   current.on('end', reason => {
     const text = safeReason(reason);
     connectionState = `Отключён: ${text}`;
+    authState = 'unknown';
     if (minecraft === current) minecraft = null;
     mapCapture.detach();
     inventoryController.detach();
@@ -602,12 +613,14 @@ function disconnectMinecraft(manual = true) {
 
   if (!minecraft) {
     connectionState = 'Отключён';
+    authState = 'unknown';
     return;
   }
 
   const current = minecraft;
   minecraft = null;
   connectionState = 'Отключён вручную';
+  authState = 'unknown';
   mapCapture.detach();
   inventoryController.detach();
   try { current.quit('Отключение через Telegram'); } catch {}
@@ -635,11 +648,16 @@ async function showMain(ctx, text = '🤖 Управление Minecraft-бот�
 async function sendToMinecraft(ctx, text) {
   if (!minecraft) return ctx.reply('Minecraft сейчас не подключён.', mainKeyboard);
 
+  const authMatch = text.match(/^\/(reg(?:ister)?|login)\b/i);
+  if (authMatch) {
+    markAuthAttempt(/^reg/i.test(authMatch[1]) ? 'register' : 'login');
+  }
+
   minecraft.chat(text);
 
-  if (/^\/(?:reg(?:ister)?|login)\b/i.test(text)) {
+  if (authMatch) {
     try { await ctx.deleteMessage(); } catch {}
-    return ctx.reply('📤 Команда авторизации отправлена в Minecraft.', mainKeyboard);
+    return ctx.reply('📤 Команда авторизации отправлена в Minecraft. Жду ответ сервера.', mainKeyboard);
   }
 
   return ctx.reply('📤 Отправлено в Minecraft.', mainKeyboard);
@@ -754,7 +772,7 @@ telegram.hears('🗺 Капча / карта', ctx => {
 
 telegram.hears('📋 Все системные', ctx => {
   pendingAction = null;
-  const latest = rawSystemMessages.slice(-40);
+  const latest = rawSystemMessages.slice(-50);
   if (!latest.length) return ctx.reply('Системных сообщений пока нет.', mainKeyboard);
 
   const text = latest
@@ -762,7 +780,7 @@ telegram.hears('📋 Все системные', ctx => {
     .join('\n')
     .slice(0, 3900);
 
-  return ctx.reply(`📋 Полный сырой журнал:\n\n${text}`, mainKeyboard);
+  return ctx.reply(`📋 Полный журнал системных сообщений:\n\n${text}`, mainKeyboard);
 });
 
 telegram.hears('❌ Отмена', ctx => {
@@ -778,7 +796,8 @@ telegram.on('text', async ctx => {
     if (!minecraft) return ctx.reply('Minecraft сейчас не подключён.', mainKeyboard);
     minecraft.chat(text);
     captchaActive = false;
-    connectionState = 'Ответ капчи отправлен, жду сервер';
+    authState = 'unknown';
+    connectionState = 'Ответ капчи отправлен, жду сообщения сервера';
     return ctx.reply('📤 Ответ капчи отправлен.', mainKeyboard);
   }
 

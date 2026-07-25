@@ -41,16 +41,16 @@ function loadConfig() {
 let config = loadConfig();
 
 function saveConfig() {
-  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, {
-    mode: 0o600
-  });
-
+  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   try {
     fs.chmodSync(CONFIG_PATH, 0o600);
   } catch {}
 }
 
 const telegram = new Telegraf(TELEGRAM_TOKEN);
+const screenService = new ScreenService();
+const mapCapture = new MapCapture();
+
 let minecraft = null;
 let connectionState = 'Отключён';
 let reconnectTimer = null;
@@ -58,6 +58,10 @@ let reconnectEnabled = false;
 let pendingAction = null;
 let lastMessages = [];
 let screenBusy = false;
+let captchaActive = false;
+let captchaScreenSent = false;
+let captchaScreenTimer = null;
+let lastCaptchaNoticeAt = 0;
 
 const mainKeyboard = Markup.keyboard([
   ['▶️ Подключить', '⏹ Отключить'],
@@ -65,8 +69,7 @@ const mainKeyboard = Markup.keyboard([
   ['⚙️ Сервер', '👤 Ник'],
   ['🔐 Пароль', '📝 Авторизация'],
   ['💬 Написать в чат', '📸 Экран'],
-  ['🗺 Последняя карта', '📋 Логи'],
-  ['❌ Отмена']
+  ['📋 Логи', '❌ Отмена']
 ]).resize().persistent();
 
 const authKeyboard = Markup.inlineKeyboard([
@@ -76,22 +79,6 @@ const authKeyboard = Markup.inlineKeyboard([
   ],
   [Markup.button.callback('✋ Вручную', 'auth_manual')]
 ]);
-
-const screenService = new ScreenService();
-const mapCapture = new MapCapture(async (image, mapId) => {
-  try {
-    await telegram.telegram.sendPhoto(
-      ADMIN_ID,
-      { source: image, filename: `map-${mapId}.png` },
-      {
-        caption: '🧩 Получена карта. Если это капча, нажми «💬 Написать в чат» и отправь цифры.',
-        reply_markup: mainKeyboard.reply_markup
-      }
-    );
-  } catch (error) {
-    console.error('Не удалось отправить карту в Telegram:', error.message);
-  }
-});
 
 function cleanText(value) {
   return String(value ?? '')
@@ -140,7 +127,7 @@ function authModeLabel() {
 
 function statusText() {
   const lines = [
-    minecraft ? '🟢 Minecraft запущен' : '🔴 Minecraft отключён',
+    minecraft ? '🟢 Minecraft подключён' : '🔴 Minecraft отключён',
     `Состояние: ${connectionState}`,
     `Сервер: ${config.host || 'не задан'}:${config.port}`,
     `Ник: ${config.username || 'не задан'}`,
@@ -149,16 +136,20 @@ function statusText() {
   ];
 
   if (minecraft?.entity?.position) {
-    const p = minecraft.entity.position;
-    lines.push(`Координаты: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`);
+    const position = minecraft.entity.position;
+    lines.push(`Координаты: ${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)}`);
     lines.push(`Здоровье: ${minecraft.health ?? '?'}`);
     lines.push(`Голод: ${minecraft.food ?? '?'}`);
+  }
+
+  if (mapCapture.lastImage) {
+    lines.push('Карта/капча: получена');
   }
 
   return lines.join('\n');
 }
 
-function screenData() {
+function screenData(forceMap = false) {
   const hotbar = Array.from({ length: 9 }, (_, index) => {
     const item = minecraft?.inventory?.slots?.[36 + index];
     if (!item) return '';
@@ -167,8 +158,8 @@ function screenData() {
     return item.count > 1 ? `${title}\nx${item.count}` : title;
   });
 
-  const currentWindow = minecraft?.currentWindow;
   let windowTitle = '';
+  const currentWindow = minecraft?.currentWindow;
 
   if (currentWindow?.title) {
     try {
@@ -181,28 +172,38 @@ function screenData() {
   const position = minecraft?.entity?.position;
   const coordinates = position
     ? `${position.x.toFixed(1)} ${position.y.toFixed(1)} ${position.z.toFixed(1)}`
-    : '? ? ?';
+    : 'ещё не загружены';
+
+  const showMap = Boolean(mapCapture.lastImage && (forceMap || captchaActive));
 
   return {
     status: [
       `${config.host}:${config.port}`,
       `Ник: ${config.username}`,
+      `Состояние: ${connectionState}`,
       `HP: ${minecraft?.health ?? '?'} | Еда: ${minecraft?.food ?? '?'}`,
       `XYZ: ${coordinates}`
     ].join('\n'),
     messages: lastMessages.slice(-8),
     hotbar,
     selectedSlot: Number(minecraft?.quickBarSlot || 0),
-    windowTitle
+    windowTitle,
+    mapDataUrl: showMap
+      ? `data:image/png;base64,${mapCapture.lastImage.toString('base64')}`
+      : ''
   };
 }
 
-async function sendScreen(ctx) {
-  pendingAction = null;
-
-  if (!minecraft?.entity) {
-    return ctx.reply('Minecraft сейчас не находится в мире.', mainKeyboard);
+async function createScreen(forceMap = false) {
+  if (!minecraft && !mapCapture.lastImage) {
+    throw new Error('Minecraft не подключён и изображения карты ещё нет.');
   }
+
+  return screenService.capture(screenData(forceMap));
+}
+
+async function sendScreen(ctx, forceMap = false) {
+  pendingAction = null;
 
   if (screenBusy) {
     return ctx.reply('📸 Скрин уже создаётся. Подожди несколько секунд.', mainKeyboard);
@@ -212,7 +213,7 @@ async function sendScreen(ctx) {
 
   try {
     await ctx.sendChatAction('upload_photo');
-    const image = await screenService.capture(screenData());
+    const image = await createScreen(forceMap);
 
     return await ctx.replyWithPhoto(
       { source: image, filename: 'minecraft-screen.png' },
@@ -223,13 +224,65 @@ async function sendScreen(ctx) {
     );
   } catch (error) {
     console.error('Ошибка создания скрина:', error);
-    return ctx.reply(
-      `⚠️ Скрин не получился: ${cleanText(error.message)}\nБот остаётся подключён, можно попробовать ещё раз через несколько секунд.`,
-      mainKeyboard
-    );
+    return ctx.reply(`⚠️ Скрин не получился: ${cleanText(error.message)}`, mainKeyboard);
   } finally {
     screenBusy = false;
   }
+}
+
+async function sendAutomaticCaptchaScreen() {
+  if (captchaScreenSent || screenBusy || !captchaActive) return;
+
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    if (!captchaActive || captchaScreenSent) return;
+
+    if (mapCapture.lastImage) {
+      screenBusy = true;
+
+      try {
+        const image = await createScreen(true);
+        await telegram.telegram.sendPhoto(
+          ADMIN_ID,
+          { source: image, filename: 'minecraft-captcha-screen.png' },
+          {
+            caption: '🧩 Полный экран с капчей. Нажми «💬 Написать в чат» и отправь цифры.',
+            reply_markup: mainKeyboard.reply_markup
+          }
+        );
+        captchaScreenSent = true;
+      } catch (error) {
+        console.error('Не удалось отправить общий скрин капчи:', error);
+      } finally {
+        screenBusy = false;
+      }
+
+      return;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 700));
+  }
+
+  if (!captchaScreenSent) {
+    notify('🧩 Сервер просит капчу, но картинка ещё не была получена. Нажми «📸 Экран» через секунду.');
+  }
+}
+
+function scheduleCaptchaScreen() {
+  if (captchaScreenTimer || captchaScreenSent) return;
+
+  captchaScreenTimer = setTimeout(async () => {
+    captchaScreenTimer = null;
+    await sendAutomaticCaptchaScreen();
+  }, 1000);
+}
+
+function resetCaptchaState() {
+  captchaActive = false;
+  captchaScreenSent = false;
+  lastCaptchaNoticeAt = 0;
+
+  if (captchaScreenTimer) clearTimeout(captchaScreenTimer);
+  captchaScreenTimer = null;
 }
 
 function scheduleReconnect() {
@@ -255,6 +308,8 @@ function connectMinecraft() {
 
   reconnectEnabled = true;
   connectionState = 'Подключение';
+  resetCaptchaState();
+  lastMessages = [];
 
   const options = {
     host: config.host,
@@ -271,7 +326,7 @@ function connectMinecraft() {
   mapCapture.attach(current);
 
   current.once('login', () => {
-    connectionState = 'Подключён, загружается мир';
+    connectionState = 'Подключён, ожидается вход';
     notify(`🔌 Подключился к ${config.host}:${config.port}`);
   });
 
@@ -298,8 +353,16 @@ function connectMinecraft() {
     remember(text);
     console.log('[MC]', text);
 
-    if (/капч|captcha|введите код|картинк|проверочн/i.test(text)) {
-      notify(`🧩 Сервер просит капчу:\n${text}\nКарта придёт отдельной картинкой, если сервер прислал её боту.`);
+    if (/капч|captcha|введите код|номер с картинки|проверочн/i.test(text)) {
+      captchaActive = true;
+      const now = Date.now();
+
+      if (now - lastCaptchaNoticeAt > 10000) {
+        lastCaptchaNoticeAt = now;
+        notify('🧩 Сервер запросил капчу. Готовлю один полный скрин экрана.');
+      }
+
+      scheduleCaptchaScreen();
     }
   });
 
@@ -324,6 +387,7 @@ function connectMinecraft() {
     if (minecraft === current) minecraft = null;
     mapCapture.detach();
     screenService.detachViewer().catch(() => {});
+    resetCaptchaState();
 
     notify(`🔌 Minecraft отключён:\n${text}`);
     scheduleReconnect();
@@ -336,6 +400,7 @@ function disconnectMinecraft(manual = true) {
   if (manual) reconnectEnabled = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  resetCaptchaState();
 
   if (!minecraft) {
     connectionState = 'Отключён';
@@ -355,6 +420,7 @@ function disconnectMinecraft(manual = true) {
 
 function reconnectMinecraft() {
   reconnectEnabled = true;
+  resetCaptchaState();
 
   if (minecraft) {
     const current = minecraft;
@@ -386,9 +452,9 @@ telegram.use(async (ctx, next) => {
 telegram.start(ctx => showMain(ctx));
 telegram.command('menu', ctx => showMain(ctx));
 telegram.command('status', ctx => ctx.reply(statusText(), mainKeyboard));
-telegram.command('screen', ctx => sendScreen(ctx));
+telegram.command('screen', ctx => sendScreen(ctx, captchaActive));
 
-telegram.hears('▶️ Подключить', async ctx => {
+telegram.hears('▶️ Подключить', ctx => {
   pendingAction = null;
 
   if (minecraft) return ctx.reply('Бот уже подключается или находится в игре.', mainKeyboard);
@@ -420,10 +486,7 @@ telegram.hears('🔄 Перезайти', ctx => {
 
 telegram.hears('⚙️ Сервер', ctx => {
   pendingAction = 'server';
-  return ctx.reply(
-    'Отправь адрес сервера. Можно так:\nplay.funtime.su\nили так:\nplay.funtime.su:25565',
-    mainKeyboard
-  );
+  return ctx.reply('Отправь адрес сервера: play.funtime.su или play.funtime.su:25565', mainKeyboard);
 });
 
 telegram.hears('👤 Ник', ctx => {
@@ -438,10 +501,7 @@ telegram.hears('🔐 Пароль', ctx => {
 
 telegram.hears('📝 Авторизация', ctx => {
   pendingAction = null;
-  return ctx.reply(
-    `Текущий режим: ${authModeLabel()}\nВыбери, что отправлять после входа:`,
-    authKeyboard
-  );
+  return ctx.reply(`Текущий режим: ${authModeLabel()}\nВыбери режим:`, authKeyboard);
 });
 
 telegram.action('auth_login', async ctx => {
@@ -473,23 +533,7 @@ telegram.hears('💬 Написать в чат', ctx => {
   return ctx.reply('Отправь текст или команду для Minecraft.', mainKeyboard);
 });
 
-telegram.hears('📸 Экран', ctx => sendScreen(ctx));
-
-telegram.hears('🗺 Последняя карта', ctx => {
-  pendingAction = null;
-
-  if (!mapCapture.lastImage) {
-    return ctx.reply('Карта ещё не была получена от сервера.', mainKeyboard);
-  }
-
-  return ctx.replyWithPhoto(
-    { source: mapCapture.lastImage, filename: 'last-map.png' },
-    {
-      caption: '🗺 Последняя карта, полученная ботом.',
-      reply_markup: mainKeyboard.reply_markup
-    }
-  );
-});
+telegram.hears('📸 Экран', ctx => sendScreen(ctx, captchaActive));
 
 telegram.hears('📋 Логи', ctx => {
   pendingAction = null;
@@ -541,28 +585,17 @@ telegram.on('text', async ctx => {
     config.host = host;
     config.port = port;
     saveConfig();
-
-    return ctx.reply(
-      `✅ Сервер сохранён: ${host}:${port}\nНажми «🔄 Перезайти», чтобы применить.`,
-      mainKeyboard
-    );
+    return ctx.reply(`✅ Сервер сохранён: ${host}:${port}\nНажми «🔄 Перезайти».`, mainKeyboard);
   }
 
   if (action === 'username') {
     if (!/^[A-Za-z0-9_]{3,16}$/.test(text)) {
-      return ctx.reply(
-        'Ник должен содержать 3–16 символов: английские буквы, цифры и _.',
-        mainKeyboard
-      );
+      return ctx.reply('Ник должен содержать 3–16 символов: английские буквы, цифры и _.', mainKeyboard);
     }
 
     config.username = text;
     saveConfig();
-
-    return ctx.reply(
-      `✅ Ник сохранён: ${text}\nНажми «🔄 Перезайти», чтобы применить.`,
-      mainKeyboard
-    );
+    return ctx.reply(`✅ Ник сохранён: ${text}\nНажми «🔄 Перезайти».`, mainKeyboard);
   }
 
   if (action === 'password') {
@@ -582,7 +615,16 @@ telegram.on('text', async ctx => {
 
   if (action === 'chat') {
     if (!minecraft) return ctx.reply('Minecraft сейчас не подключён.', mainKeyboard);
+
     minecraft.chat(text);
+
+    if (captchaActive) {
+      captchaActive = false;
+      captchaScreenSent = false;
+      if (captchaScreenTimer) clearTimeout(captchaScreenTimer);
+      captchaScreenTimer = null;
+    }
+
     return ctx.reply('📤 Отправлено в Minecraft.', mainKeyboard);
   }
 });
@@ -594,6 +636,7 @@ telegram.catch(error => {
 async function shutdown(signal) {
   reconnectEnabled = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (captchaScreenTimer) clearTimeout(captchaScreenTimer);
   mapCapture.detach();
 
   if (minecraft) {

@@ -1,6 +1,6 @@
 {
   "name": "minecraft-bot",
-  "version": "1.4.1",
+  "version": "1.4.0",
   "private": true,
   "description": "Minecraft Mineflayer bot controlled from Telegram",
   "main": "bot.js",
@@ -15,7 +15,6 @@
     "dotenv": "latest",
     "flayercaptcha": "github:ImPhoba/FlayerCaptcha#d3f55a03fa07fdc016bfa5003bec94cf7b059e8e",
     "mineflayer": "latest",
-    "prismarine-item": "latest",
     "telegraf": "latest"
   }
 }

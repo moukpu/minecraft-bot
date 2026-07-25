@@ -22,13 +22,7 @@ class InventoryController {
     this.onState = onState;
     this.bot = null;
     this.listeners = [];
-    this.clientListeners = [];
-    this.nativeSetSlotListeners = [];
-    this.inventoryListener = null;
     this.currentWindow = null;
-    this.inventoryPackets = 0;
-    this.hotbarAnnounced = false;
-    this.hotbarNotifyTimer = null;
     this.lastGuiClickAt = 0;
     this.pendingCloseTimer = null;
     this.loadingTimer = null;
@@ -40,23 +34,13 @@ class InventoryController {
     this.detach();
     this.bot = bot;
     this.currentWindow = bot.currentWindow || null;
-    this.inventoryPackets = 0;
-    this.hotbarAnnounced = false;
 
     this.listen('windowOpen', window => this.handleWindowOpen(window));
     this.listen('windowClose', window => this.handleWindowClose(window));
     this.listen('respawn', () => this.handleWorldSignal('respawn'));
-    this.listen('game', () => this.handleWorldSignal('смена режима/мира'));
+    this.listen('game', () => this.handleWorldSignal('смена мира'));
     this.listen('spawn', () => this.handleWorldSignal('spawn'));
     this.listen('forcedMove', () => this.handleWorldSignal('телепортация'));
-
-    // Сохраняем родные обработчики Mineflayer до добавления нашего.
-    this.nativeSetSlotListeners = bot._client.listeners('set_slot').slice();
-    this.listenClient('set_slot', packet => this.handleSetSlot(packet));
-
-    this.inventoryListener = () => this.scheduleHotbarNotification();
-    bot.inventory.on('updateSlot', this.inventoryListener);
-    setTimeout(() => this.scheduleHotbarNotification(), 1000);
   }
 
   detach() {
@@ -64,36 +48,17 @@ class InventoryController {
       for (const [event, listener] of this.listeners) {
         this.bot.removeListener(event, listener);
       }
-
-      for (const [event, listener] of this.clientListeners) {
-        this.bot._client.removeListener(event, listener);
-      }
-
-      if (this.inventoryListener && this.bot.inventory) {
-        this.bot.inventory.removeListener('updateSlot', this.inventoryListener);
-      }
     }
 
     this.listeners = [];
-    this.clientListeners = [];
-    this.nativeSetSlotListeners = [];
-    this.inventoryListener = null;
     this.bot = null;
     this.currentWindow = null;
-    this.inventoryPackets = 0;
-    this.hotbarAnnounced = false;
     this.loading = false;
 
-    for (const timer of [
-      this.hotbarNotifyTimer,
-      this.pendingCloseTimer,
-      this.loadingTimer,
-      this.loadingFallbackTimer
-    ]) {
+    for (const timer of [this.pendingCloseTimer, this.loadingTimer, this.loadingFallbackTimer]) {
       if (timer) clearTimeout(timer);
     }
 
-    this.hotbarNotifyTimer = null;
     this.pendingCloseTimer = null;
     this.loadingTimer = null;
     this.loadingFallbackTimer = null;
@@ -102,75 +67,6 @@ class InventoryController {
   listen(event, listener) {
     this.bot.on(event, listener);
     this.listeners.push([event, listener]);
-  }
-
-  listenClient(event, listener) {
-    this.bot._client.on(event, listener);
-    this.clientListeners.push([event, listener]);
-  }
-
-  normalizeWindowId(value) {
-    const number = Number(value);
-    if (number === 254) return -2;
-    if (number === 255) return -1;
-    return number;
-  }
-
-  handleSetSlot(packet) {
-    this.inventoryPackets += 1;
-    const windowId = this.normalizeWindowId(packet.windowId);
-
-    // Bukkit/Spigot иногда шлёт прямое обновление инвентаря через окно -2.
-    // Mineflayer игнорирует его. Передаём тот же пакет его родному обработчику
-    // как окно 0, чтобы предмет был разобран совместимой версией prismarine-item.
-    if (windowId === -2) {
-      const patched = { ...packet, windowId: 0 };
-
-      for (const listener of this.nativeSetSlotListeners) {
-        try {
-          listener.call(this.bot._client, patched);
-        } catch (error) {
-          console.error('Ошибка применения lobby set_slot:', error.message);
-        }
-      }
-    }
-
-    this.scheduleHotbarNotification();
-  }
-
-  hotbarStart() {
-    return Number(this.bot?.QUICK_BAR_START ?? this.bot?.inventory?.hotbarStart ?? 36);
-  }
-
-  hotbarItems() {
-    const start = this.hotbarStart();
-    return Array.from({ length: 9 }, (_, index) => this.bot?.inventory?.slots?.[start + index] || null);
-  }
-
-  scheduleHotbarNotification() {
-    if (!this.bot || this.hotbarAnnounced) return;
-    if (this.hotbarNotifyTimer) clearTimeout(this.hotbarNotifyTimer);
-
-    this.hotbarNotifyTimer = setTimeout(() => {
-      this.hotbarNotifyTimer = null;
-      if (!this.bot || this.hotbarAnnounced) return;
-      if (!this.hotbarItems().some(Boolean)) return;
-
-      this.hotbarAnnounced = true;
-      this.notify(`🎒 Хотбар загружен.\n${this.describeHotbar()}`).catch(console.error);
-    }, 350);
-  }
-
-  async waitForInventorySync(timeoutMs = 2500) {
-    if (this.hotbarItems().some(Boolean)) return true;
-
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMs) {
-      await sleep(150);
-      if (this.hotbarItems().some(Boolean)) return true;
-    }
-
-    return false;
   }
 
   async handleWindowOpen(window) {
@@ -283,16 +179,12 @@ class InventoryController {
   }
 
   describeHotbar() {
-    const items = this.hotbarItems();
     const lines = ['🎒 Меню закрыто. Хотбар:'];
 
     for (let index = 0; index < 9; index += 1) {
+      const item = this.bot?.inventory?.slots?.[36 + index];
       const selected = Number(this.bot?.quickBarSlot) === index ? ' ← выбран' : '';
-      lines.push(`${index + 1}: ${itemName(items[index])}${selected}`);
-    }
-
-    if (!items.some(Boolean)) {
-      lines.push('', `⚠️ Хотбар пока не синхронизирован. Пакетов set_slot получено: ${this.inventoryPackets}.`);
+      lines.push(`${index + 1}: ${itemName(item)}${selected}`);
     }
 
     lines.push('', 'Команды: слот 4 | пкм | лкм | меню');
@@ -307,9 +199,7 @@ class InventoryController {
       '• пкм слот 15: правый клик по GUI-слоту №15',
       '• лкм слот 15: левый клик по GUI-слоту №15',
       '• меню / слоты: показать интерфейс или хотбар',
-      '• закрыть меню: закрыть текущий интерфейс',
-      '',
-      'GUI-слоты считаются с 0, хотбар с 1.'
+      '• закрыть меню: закрыть текущий интерфейс'
     ].join('\n');
   }
 
@@ -317,7 +207,6 @@ class InventoryController {
     const normalized = cleanText(rawText).toLowerCase().replace(/ё/g, 'е');
 
     if (/^(?:меню|слоты|инвентарь|inventory|gui)$/i.test(normalized)) {
-      if (!this.bot?.currentWindow) await this.waitForInventorySync();
       return { handled: true, message: this.describeWindow() };
     }
 
@@ -353,14 +242,13 @@ class InventoryController {
     if (error) return { handled: true, message: error };
     if (this.bot.currentWindow) return this.clickGuiSlot(slot, 0);
 
-    await this.waitForInventorySync(1200);
     if (!Number.isInteger(slot) || slot < 1 || slot > 9) {
       return { handled: true, message: 'Без открытого меню номер хотбара должен быть от 1 до 9.' };
     }
 
     this.bot.setQuickBarSlot(slot - 1);
     await sleep(120);
-    return { handled: true, message: `✅ Выбран хотбар ${slot}: ${itemName(this.hotbarItems()[slot - 1])}` };
+    return { handled: true, message: `✅ Выбран хотбар ${slot}: ${itemName(this.bot.heldItem)}` };
   }
 
   async clickSlot(slot, button) {
@@ -415,8 +303,7 @@ class InventoryController {
     if (error) return { handled: true, message: error };
     if (this.bot.currentWindow) return { handled: true, message: 'Меню открыто. Напиши «пкм слот 15».' };
 
-    await this.waitForInventorySync(1200);
-    const held = itemName(this.hotbarItems()[Number(this.bot.quickBarSlot || 0)]);
+    const held = itemName(this.bot.heldItem);
     this.bot.activateItem(false);
     setTimeout(() => {
       try { this.bot?.deactivateItem(); } catch {}

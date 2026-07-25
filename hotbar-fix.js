@@ -95,20 +95,32 @@ mineflayer.createBot = function createBotWithFunTimeFixes(options = {}) {
     console.error('[hotbar-fix] Не удалось загрузить prismarine-item:', error.message);
   }
 
-  function applyInventorySlot(slot, rawItem) {
-    if (!Item || !bot.inventory || !Number.isInteger(slot) || slot < 0) return;
-
+  function parseItem(rawItem) {
+    if (!Item) return null;
     try {
       const item = Item.fromNotch(rawItem);
       normalizeItemName(item);
+      return item;
+    } catch (error) {
+      console.error('[inventory-fix] Не удалось разобрать предмет:', error.message);
+      return null;
+    }
+  }
 
+  function applyInventorySlot(slot, rawItem) {
+    if (!bot.inventory || !Number.isInteger(slot) || slot < 0) return false;
+
+    const item = parseItem(rawItem);
+    try {
       if (typeof bot._setSlot === 'function') bot._setSlot(slot, item, bot.inventory);
       else {
         bot.inventory.updateSlot(slot, item);
         bot.updateHeldItem?.();
       }
+      return true;
     } catch (error) {
       console.error(`[inventory-fix] Не удалось применить слот ${slot}:`, error.message);
+      return false;
     }
   }
 
@@ -127,23 +139,37 @@ mineflayer.createBot = function createBotWithFunTimeFixes(options = {}) {
     }
   });
 
-  // На 1.21.4 FunTime присылает весь инвентарь одним window_items для окна 0.
-  // В массиве из 46 элементов хотбар находится в слотах 36..44.
   bot._client.on('window_items', packet => {
     try {
       const windowId = normalizeWindowId(packet.windowId);
       const items = Array.isArray(packet.items) ? packet.items : [];
-      if (windowId !== 0 || items.length < 45) return;
+      if (windowId !== 0 || items.length < 45 || !bot.inventory) return;
 
-      const limit = Math.min(items.length, bot.inventory?.slots?.length || items.length);
-      for (let slot = 0; slot < limit; slot += 1) {
-        applyInventorySlot(slot, items[slot]);
+      // Родной Mineflayer уже применил window_items до этого обработчика.
+      // На FunTime 1.21.4 селектор иногда лежит в индексах 0..8,
+      // хотя настоящий хотбар окна inventory находится в 36..44.
+      const hotbarStart = Number(bot.QUICK_BAR_START ?? bot.inventory.hotbarStart ?? 36);
+      const normalHotbarHasItems = bot.inventory.slots
+        .slice(hotbarStart, hotbarStart + 9)
+        .some(Boolean);
+      const compactIndexes = [];
+
+      for (let index = 0; index < 9; index += 1) {
+        if (bot.inventory.slots[index]) compactIndexes.push(index);
       }
 
-      bot.updateHeldItem?.();
-      console.log(`[inventory-fix] window_items 0: применено ${limit} слотов`);
+      if (!normalHotbarHasItems && compactIndexes.length) {
+        let applied = 0;
+        for (const compactSlot of compactIndexes) {
+          if (applyInventorySlot(hotbarStart + compactSlot, items[compactSlot])) applied += 1;
+        }
+        bot.updateHeldItem?.();
+        console.log(`[hotbar-fix] window_items compact [${compactIndexes.join(',')}] -> hotbar, применено=${applied}`);
+      } else {
+        console.log(`[inventory-fix] window_items 0: обычный хотбар=${normalHotbarHasItems ? 'есть' : 'пуст'}, compact=[${compactIndexes.join(',')}]`);
+      }
     } catch (error) {
-      console.error('[inventory-fix] Ошибка применения window_items:', error.message);
+      console.error('[inventory-fix] Ошибка обработки window_items:', error.message);
     }
   });
 

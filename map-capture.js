@@ -4,50 +4,136 @@ const { PNG } = require('pngjs');
 
 const MAP_SIZE = 128;
 const QUIET_RENDER_DELAY_MS = 1800;
+const MAX_LAYOUT_WAIT_MS = 6500;
 
 function unsignedByte(value) {
   const number = Number(value || 0);
   return number < 0 ? number + 256 : number;
 }
 
+function unwrapNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (!value || typeof value !== 'object') return null;
+
+  if (typeof value.value === 'number' && Number.isFinite(value.value)) {
+    return value.value;
+  }
+
+  return null;
+}
+
+function extractMapId(value, depth = 0, keyHint = '') {
+  if (depth > 10 || value == null) return null;
+
+  if (/^(map|mapid|itemdamage)$/i.test(keyHint)) {
+    const direct = unwrapNumber(value);
+    if (direct != null) return direct;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const result = extractMapId(entry, depth + 1, keyHint);
+      if (result != null) return result;
+    }
+    return null;
+  }
+
+  if (typeof value !== 'object') return null;
+
+  const itemName = String(value.name || value.displayName || '').toLowerCase();
+  if (itemName.includes('filled_map') || itemName === 'map') {
+    for (const key of ['mapId', 'itemDamage', 'metadata', 'damage']) {
+      const result = unwrapNumber(value[key]);
+      if (result != null) return result;
+    }
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (/^(map|mapid|itemdamage)$/i.test(key)) {
+      const result = unwrapNumber(child);
+      if (result != null) return result;
+    }
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    const result = extractMapId(child, depth + 1, key);
+    if (result != null) return result;
+  }
+
+  return null;
+}
+
+function roundedCoordinate(value) {
+  return Math.round(Number(value) * 4) / 4;
+}
+
+function uniqueSorted(values, direction = 1) {
+  return Array.from(new Set(values.map(roundedCoordinate)))
+    .sort((a, b) => (a - b) * direction);
+}
+
 class MapCapture {
   constructor() {
     this.bot = null;
-    this.listener = null;
+    this.listeners = [];
     this.maps = new Map();
+    this.frames = new Map();
+    this.mapPositions = new Map();
     this.mapArrivalOrder = [];
     this.renderTimer = null;
     this.colorsPromise = null;
     this.lastImage = null;
     this.lastPacketAt = 0;
+    this.firstMapAt = 0;
     this.lastUpdatedAt = 0;
     this.lastMapCount = 0;
     this.lastGrid = null;
+    this.itemFrameTypeIds = new Set();
   }
 
   attach(bot) {
     this.detach();
     this.lastImage = null;
     this.lastPacketAt = 0;
+    this.firstMapAt = 0;
     this.lastUpdatedAt = 0;
     this.lastMapCount = 0;
     this.lastGrid = null;
     this.bot = bot;
-    this.listener = packet => this.handlePacket(packet);
-    bot._client.on('map', this.listener);
+
+    const registry = bot.registry || require('minecraft-data')(bot.version);
+    for (const name of ['item_frame', 'glow_item_frame']) {
+      const entity = registry?.entitiesByName?.[name];
+      if (entity?.id != null) this.itemFrameTypeIds.add(Number(entity.id));
+    }
+
+    this.listen('map', packet => this.handleMapPacket(packet));
+    this.listen('spawn_entity', packet => this.handleSpawnEntity(packet));
+    this.listen('entity_metadata', packet => this.handleEntityMetadata(packet));
+    this.listen('entity_destroy', packet => this.handleEntityDestroy(packet));
+  }
+
+  listen(eventName, handler) {
+    this.bot._client.on(eventName, handler);
+    this.listeners.push([eventName, handler]);
   }
 
   detach() {
-    if (this.bot && this.listener) {
-      this.bot._client.removeListener('map', this.listener);
+    if (this.bot) {
+      for (const [eventName, handler] of this.listeners) {
+        this.bot._client.removeListener(eventName, handler);
+      }
     }
 
     if (this.renderTimer) clearTimeout(this.renderTimer);
     this.renderTimer = null;
+    this.listeners = [];
     this.maps.clear();
+    this.frames.clear();
+    this.mapPositions.clear();
     this.mapArrivalOrder = [];
+    this.itemFrameTypeIds.clear();
     this.bot = null;
-    this.listener = null;
   }
 
   async getColors() {
@@ -59,7 +145,7 @@ class MapCapture {
     return this.colorsPromise;
   }
 
-  handlePacket(packet) {
+  handleMapPacket(packet) {
     try {
       const mapId = Number(packet.itemDamage ?? packet.mapId ?? packet.id ?? 0);
       const raw = packet.data ?? packet.mapColors;
@@ -99,14 +185,117 @@ class MapCapture {
       }
 
       this.maps.set(mapId, pixels);
-      this.lastPacketAt = Date.now();
+      const now = Date.now();
+      if (!this.firstMapAt) this.firstMapAt = now;
+      this.lastPacketAt = now;
       this.scheduleRender();
     } catch (error) {
       console.error('Ошибка чтения map-пакета:', error);
     }
   }
 
-  scheduleRender() {
+  handleSpawnEntity(packet) {
+    const entityId = Number(packet.entityId ?? packet.id);
+    const type = Number(packet.type ?? packet.entityType);
+    if (!Number.isFinite(entityId) || !this.itemFrameTypeIds.has(type)) return;
+
+    this.frames.set(entityId, {
+      entityId,
+      x: Number(packet.x),
+      y: Number(packet.y),
+      z: Number(packet.z),
+      mapId: null
+    });
+
+    setTimeout(() => this.readFrameFromMineflayer(entityId), 50);
+  }
+
+  handleEntityMetadata(packet) {
+    const entityId = Number(packet.entityId ?? packet.id);
+    if (!Number.isFinite(entityId)) return;
+
+    if (!this.frames.has(entityId)) {
+      const entity = this.bot?.entities?.[entityId];
+      if (!this.isItemFrameEntity(entity)) return;
+
+      this.frames.set(entityId, {
+        entityId,
+        x: Number(entity.position.x),
+        y: Number(entity.position.y),
+        z: Number(entity.position.z),
+        mapId: null
+      });
+    }
+
+    const mapId = extractMapId(packet.metadata);
+    if (mapId != null) {
+      this.assignMapToFrame(entityId, mapId);
+    } else {
+      setTimeout(() => this.readFrameFromMineflayer(entityId), 20);
+    }
+  }
+
+  handleEntityDestroy(packet) {
+    const ids = packet.entityIds || packet.entities || packet.entityId || [];
+    const list = Array.isArray(ids) ? ids : [ids];
+
+    for (const rawId of list) {
+      const entityId = Number(rawId);
+      const frame = this.frames.get(entityId);
+      if (frame?.mapId != null) this.mapPositions.delete(frame.mapId);
+      this.frames.delete(entityId);
+    }
+  }
+
+  isItemFrameEntity(entity) {
+    if (!entity) return false;
+    const name = String(entity.name || entity.displayName || entity.mobType || '').toLowerCase();
+    return name.includes('item_frame') || name.includes('item frame');
+  }
+
+  readFrameFromMineflayer(entityId) {
+    const entity = this.bot?.entities?.[entityId];
+    if (!this.isItemFrameEntity(entity)) return;
+
+    let frame = this.frames.get(entityId);
+    if (!frame) {
+      frame = {
+        entityId,
+        x: Number(entity.position.x),
+        y: Number(entity.position.y),
+        z: Number(entity.position.z),
+        mapId: null
+      };
+      this.frames.set(entityId, frame);
+    } else if (entity.position) {
+      frame.x = Number(entity.position.x);
+      frame.y = Number(entity.position.y);
+      frame.z = Number(entity.position.z);
+    }
+
+    const mapId = extractMapId(entity.metadata) ?? extractMapId(entity.equipment);
+    if (mapId != null) this.assignMapToFrame(entityId, mapId);
+  }
+
+  assignMapToFrame(entityId, mapId) {
+    const frame = this.frames.get(entityId);
+    if (!frame) return;
+
+    if (frame.mapId != null && frame.mapId !== mapId) {
+      this.mapPositions.delete(frame.mapId);
+    }
+
+    frame.mapId = Number(mapId);
+    this.mapPositions.set(Number(mapId), {
+      x: Number(frame.x),
+      y: Number(frame.y),
+      z: Number(frame.z)
+    });
+
+    this.scheduleRender(250);
+  }
+
+  scheduleRender(delay = QUIET_RENDER_DELAY_MS) {
     if (this.renderTimer) clearTimeout(this.renderTimer);
 
     this.renderTimer = setTimeout(async () => {
@@ -122,70 +311,113 @@ class MapCapture {
         this.lastUpdatedAt = Date.now();
 
         console.log(
-          `Собрана карта-капча: ${result.mapCount} плиток, сетка ${result.columns}x${result.rows}`
+          `Собрана карта-капча: ${result.mapCount} плиток, сетка ${result.columns}x${result.rows}, ` +
+          `раскладка=${result.layoutMode}`
         );
       } catch (error) {
         console.error('Ошибка сборки карты:', error);
       }
-    }, QUIET_RENDER_DELAY_MS);
+    }, delay);
   }
 
-  getOrderedMapIds() {
-    const ids = Array.from(this.maps.keys());
-    if (ids.length <= 1) return ids;
+  getPositionLayout(ids) {
+    const entries = ids
+      .map(mapId => ({ mapId, position: this.mapPositions.get(mapId) }))
+      .filter(entry => entry.position);
 
-    const sorted = [...ids].sort((a, b) => a - b);
-    const min = sorted[0];
-    const max = sorted[sorted.length - 1];
-    const contiguous = max - min + 1 === sorted.length;
+    if (entries.length !== ids.length || entries.length < 2) return null;
 
-    // Плагины капчи обычно создают последовательные map ID по строкам.
-    // Если ID не последовательные, сохраняем реальный порядок прихода пакетов.
-    return contiguous ? sorted : this.mapArrivalOrder.filter(id => this.maps.has(id));
+    const xValues = uniqueSorted(entries.map(entry => entry.position.x));
+    const yValues = uniqueSorted(entries.map(entry => entry.position.y), -1);
+    const zValues = uniqueSorted(entries.map(entry => entry.position.z));
+
+    const horizontalAxis = xValues.length >= zValues.length ? 'x' : 'z';
+    const botPosition = this.bot?.entity?.position;
+    let horizontalDirection = 1;
+
+    if (horizontalAxis === 'x') {
+      const planeZ = entries.reduce((sum, entry) => sum + entry.position.z, 0) / entries.length;
+      if (botPosition) horizontalDirection = botPosition.z >= planeZ ? 1 : -1;
+    } else {
+      const planeX = entries.reduce((sum, entry) => sum + entry.position.x, 0) / entries.length;
+      if (botPosition) horizontalDirection = botPosition.x >= planeX ? -1 : 1;
+    }
+
+    const columnValues = uniqueSorted(
+      entries.map(entry => entry.position[horizontalAxis]),
+      horizontalDirection
+    );
+
+    if (columnValues.length * yValues.length < ids.length) return null;
+
+    const placements = new Map();
+    for (const entry of entries) {
+      const columnValue = roundedCoordinate(entry.position[horizontalAxis]);
+      const rowValue = roundedCoordinate(entry.position.y);
+      const column = columnValues.indexOf(columnValue);
+      const row = yValues.indexOf(rowValue);
+      if (column < 0 || row < 0) return null;
+      placements.set(entry.mapId, { column, row });
+    }
+
+    return {
+      columns: columnValues.length,
+      rows: yValues.length,
+      placements,
+      mode: `frames:${horizontalAxis}${horizontalDirection > 0 ? '+' : '-'}`
+    };
   }
 
-  chooseGrid(mapCount) {
-    if (mapCount <= 1) return { columns: 1, rows: 1 };
-
+  getFallbackLayout(ids) {
+    const mapCount = ids.length;
     const exactSquare = Math.sqrt(mapCount);
+    let columns;
+    let rows;
+
     if (Number.isInteger(exactSquare)) {
-      return { columns: exactSquare, rows: exactSquare };
+      columns = exactSquare;
+      rows = exactSquare;
+    } else {
+      columns = Math.ceil(Math.sqrt(mapCount));
+      rows = Math.ceil(mapCount / columns);
     }
 
-    let bestColumns = mapCount;
-    let bestRows = 1;
-    let bestDifference = mapCount - 1;
+    const ordered = [...ids].sort((a, b) => a - b);
+    const placements = new Map();
+    ordered.forEach((mapId, index) => {
+      placements.set(mapId, {
+        column: index % columns,
+        row: Math.floor(index / columns)
+      });
+    });
 
-    for (let rows = 1; rows <= Math.sqrt(mapCount); rows += 1) {
-      if (mapCount % rows !== 0) continue;
-      const columns = mapCount / rows;
-      const difference = Math.abs(columns - rows);
-
-      if (difference < bestDifference) {
-        bestColumns = columns;
-        bestRows = rows;
-        bestDifference = difference;
-      }
-    }
-
-    // Неполный набор всё равно раскладываем максимально близко к квадрату.
-    if (bestRows === 1 && mapCount > 6) {
-      bestColumns = Math.ceil(Math.sqrt(mapCount));
-      bestRows = Math.ceil(mapCount / bestColumns);
-    }
-
-    return { columns: bestColumns, rows: bestRows };
+    return { columns, rows, placements, mode: 'fallback-map-id' };
   }
 
   async renderAllMaps() {
-    const ids = this.getOrderedMapIds();
+    const ids = Array.from(this.maps.keys());
     if (!ids.length) return null;
 
-    const { columns, rows } = this.chooseGrid(ids.length);
-    const baseWidth = columns * MAP_SIZE;
-    const baseHeight = rows * MAP_SIZE;
+    let layout = this.getPositionLayout(ids);
 
-    // Для 5x5 получается 1280x1280: читаемо и Telegram не превращает цифры в кашу.
+    if (!layout && ids.length > 1 && Date.now() - this.firstMapAt < MAX_LAYOUT_WAIT_MS) {
+      console.log(
+        `Жду координаты рамок: карты=${ids.length}, привязано=${this.mapPositions.size}`
+      );
+      this.scheduleRender(600);
+      return null;
+    }
+
+    if (!layout) {
+      console.warn(
+        `Не удалось получить координаты всех рамок: карты=${ids.length}, ` +
+        `привязано=${this.mapPositions.size}. Использую запасной порядок.`
+      );
+      layout = this.getFallbackLayout(ids);
+    }
+
+    const baseWidth = layout.columns * MAP_SIZE;
+    const baseHeight = layout.rows * MAP_SIZE;
     const scale = Math.max(1, Math.min(4, Math.floor(1280 / Math.max(baseWidth, baseHeight))));
     const png = new PNG({
       width: baseWidth * scale,
@@ -195,21 +427,20 @@ class MapCapture {
     png.data.fill(255);
     const colors = await this.getColors();
 
-    for (let tileIndex = 0; tileIndex < ids.length; tileIndex += 1) {
-      const mapId = ids[tileIndex];
+    for (const mapId of ids) {
       const pixels = this.maps.get(mapId);
-      if (!pixels) continue;
+      const placement = layout.placements.get(mapId);
+      if (!pixels || !placement) continue;
 
-      const tileColumn = tileIndex % columns;
-      const tileRow = Math.floor(tileIndex / columns);
-      this.drawTile(png, pixels, tileColumn, tileRow, scale, colors);
+      this.drawTile(png, pixels, placement.column, placement.row, scale, colors);
     }
 
     return {
       image: PNG.sync.write(png),
       mapCount: ids.length,
-      columns,
-      rows
+      columns: layout.columns,
+      rows: layout.rows,
+      layoutMode: layout.mode
     };
   }
 

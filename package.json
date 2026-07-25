@@ -1,6 +1,6 @@
 {
   "name": "minecraft-bot",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "private": true,
   "description": "Minecraft Mineflayer bot controlled from Telegram",
   "main": "bot.js",
@@ -12,11 +12,9 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@aresrpg/aresrpg-map-colors": "3.1.0",
     "dotenv": "latest",
-    "minecraft-data": "latest",
+    "flayercaptcha": "github:ImPhoba/FlayerCaptcha#d3f55a03fa07fdc016bfa5003bec94cf7b059e8e",
     "mineflayer": "latest",
-    "pngjs": "7.0.0",
     "telegraf": "latest"
   }
 }

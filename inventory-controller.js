@@ -12,7 +12,8 @@ function cleanText(value) {
 
 function itemName(item) {
   if (!item) return 'пусто';
-  const name = cleanText(item.displayName || item.name || 'предмет');
+  const customName = cleanText(item.customName || '');
+  const name = customName || cleanText(item.displayName || item.name || 'предмет');
   return `${name}${item.count > 1 ? ` x${item.count}` : ''}`;
 }
 
@@ -21,19 +22,41 @@ class InventoryController {
     this.notify = notify;
     this.onState = onState;
     this.bot = null;
+    this.Item = null;
     this.listeners = [];
+    this.clientListeners = [];
+    this.inventoryListener = null;
     this.currentWindow = null;
     this.lastGuiClickAt = 0;
     this.pendingCloseTimer = null;
     this.loadingTimer = null;
     this.loadingFallbackTimer = null;
+    this.hotbarNotifyTimer = null;
     this.loading = false;
+    this.hotbarAnnounced = false;
+    this.inventoryPackets = 0;
+    this.appliedLobbyPackets = 0;
+    this.inventoryErrors = 0;
+    this.packetSamples = [];
   }
 
   attach(bot) {
     this.detach();
     this.bot = bot;
     this.currentWindow = bot.currentWindow || null;
+    this.hotbarAnnounced = false;
+    this.inventoryPackets = 0;
+    this.appliedLobbyPackets = 0;
+    this.inventoryErrors = 0;
+    this.packetSamples = [];
+
+    try {
+      this.Item = require('prismarine-item')(bot.registry || bot.version);
+    } catch (error) {
+      this.Item = null;
+      this.inventoryErrors += 1;
+      console.error('Не удалось загрузить парсер предметов:', error.message);
+    }
 
     this.listen('windowOpen', window => this.handleWindowOpen(window));
     this.listen('windowClose', window => this.handleWindowClose(window));
@@ -41,6 +64,12 @@ class InventoryController {
     this.listen('game', () => this.handleWorldSignal('смена мира'));
     this.listen('spawn', () => this.handleWorldSignal('spawn'));
     this.listen('forcedMove', () => this.handleWorldSignal('телепортация'));
+
+    this.listenClient('set_slot', packet => this.handleRawSetSlot(packet));
+    this.listenClient('window_items', packet => this.handleRawWindowItems(packet));
+
+    this.inventoryListener = () => this.scheduleHotbarNotification();
+    if (bot.inventory?.on) bot.inventory.on('updateSlot', this.inventoryListener);
   }
 
   detach() {
@@ -48,25 +77,154 @@ class InventoryController {
       for (const [event, listener] of this.listeners) {
         this.bot.removeListener(event, listener);
       }
+
+      for (const [event, listener] of this.clientListeners) {
+        this.bot._client?.removeListener(event, listener);
+      }
+
+      if (this.inventoryListener && this.bot.inventory?.removeListener) {
+        this.bot.inventory.removeListener('updateSlot', this.inventoryListener);
+      }
     }
 
     this.listeners = [];
+    this.clientListeners = [];
+    this.inventoryListener = null;
     this.bot = null;
+    this.Item = null;
     this.currentWindow = null;
     this.loading = false;
 
-    for (const timer of [this.pendingCloseTimer, this.loadingTimer, this.loadingFallbackTimer]) {
+    for (const timer of [
+      this.pendingCloseTimer,
+      this.loadingTimer,
+      this.loadingFallbackTimer,
+      this.hotbarNotifyTimer
+    ]) {
       if (timer) clearTimeout(timer);
     }
 
     this.pendingCloseTimer = null;
     this.loadingTimer = null;
     this.loadingFallbackTimer = null;
+    this.hotbarNotifyTimer = null;
   }
 
   listen(event, listener) {
     this.bot.on(event, listener);
     this.listeners.push([event, listener]);
+  }
+
+  listenClient(event, listener) {
+    this.bot._client.on(event, listener);
+    this.clientListeners.push([event, listener]);
+  }
+
+  normalizeWindowId(value) {
+    const number = Number(value);
+    if (number === 254) return -2;
+    if (number === 255) return -1;
+    return number;
+  }
+
+  rememberPacket(text) {
+    this.packetSamples.push(text);
+    if (this.packetSamples.length > 12) this.packetSamples.shift();
+  }
+
+  parseItem(rawItem) {
+    if (!this.Item) return null;
+    return this.Item.fromNotch(rawItem);
+  }
+
+  applyPlayerInventorySlot(slot, rawItem) {
+    if (!this.bot?.inventory || !Number.isInteger(slot) || slot < 0) return;
+
+    try {
+      const item = this.parseItem(rawItem);
+      if (typeof this.bot._setSlot === 'function') {
+        this.bot._setSlot(slot, item, this.bot.inventory);
+      } else {
+        this.bot.inventory.updateSlot(slot, item);
+        this.bot.updateHeldItem?.();
+      }
+      this.appliedLobbyPackets += 1;
+    } catch (error) {
+      this.inventoryErrors += 1;
+      console.error(`Не удалось применить предмет в слот ${slot}:`, error.message);
+    }
+  }
+
+  handleRawSetSlot(packet) {
+    try {
+      this.inventoryPackets += 1;
+      const windowId = this.normalizeWindowId(packet.windowId);
+      const slot = Number(packet.slot);
+      this.rememberPacket(`set_slot: окно=${windowId}, слот=${slot}`);
+
+      if (windowId === -2) {
+        this.applyPlayerInventorySlot(slot, packet.item);
+      }
+
+      this.scheduleHotbarNotification();
+    } catch (error) {
+      this.inventoryErrors += 1;
+      console.error('Ошибка обработки set_slot:', error.message);
+    }
+  }
+
+  handleRawWindowItems(packet) {
+    try {
+      this.inventoryPackets += 1;
+      const windowId = this.normalizeWindowId(packet.windowId);
+      const items = Array.isArray(packet.items) ? packet.items : [];
+      this.rememberPacket(`window_items: окно=${windowId}, предметов=${items.length}`);
+
+      if (windowId === -2) {
+        for (let slot = 0; slot < items.length; slot += 1) {
+          this.applyPlayerInventorySlot(slot, items[slot]);
+        }
+      }
+
+      this.scheduleHotbarNotification();
+    } catch (error) {
+      this.inventoryErrors += 1;
+      console.error('Ошибка обработки window_items:', error.message);
+    }
+  }
+
+  hotbarStart() {
+    return Number(this.bot?.QUICK_BAR_START ?? this.bot?.inventory?.hotbarStart ?? 36);
+  }
+
+  hotbarItems() {
+    const start = this.hotbarStart();
+    return Array.from({ length: 9 }, (_, index) => this.bot?.inventory?.slots?.[start + index] || null);
+  }
+
+  scheduleHotbarNotification() {
+    if (!this.bot || this.hotbarAnnounced) return;
+    if (this.hotbarNotifyTimer) clearTimeout(this.hotbarNotifyTimer);
+
+    this.hotbarNotifyTimer = setTimeout(() => {
+      this.hotbarNotifyTimer = null;
+      if (!this.bot || this.hotbarAnnounced || !this.hotbarItems().some(Boolean)) return;
+
+      this.hotbarAnnounced = true;
+      this.notify(`🎒 Хотбар загружен.\n${this.describeHotbar()}`).catch(console.error);
+    }, 400);
+  }
+
+  async waitForInventorySync(timeoutMs = 2200) {
+    if (this.hotbarItems().some(Boolean)) return true;
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      await sleep(150);
+      if (this.hotbarItems().some(Boolean)) return true;
+    }
+
+    return false;
   }
 
   async handleWindowOpen(window) {
@@ -179,16 +337,24 @@ class InventoryController {
   }
 
   describeHotbar() {
+    const items = this.hotbarItems();
     const lines = ['🎒 Меню закрыто. Хотбар:'];
 
     for (let index = 0; index < 9; index += 1) {
-      const item = this.bot?.inventory?.slots?.[36 + index];
       const selected = Number(this.bot?.quickBarSlot) === index ? ' ← выбран' : '';
-      lines.push(`${index + 1}: ${itemName(item)}${selected}`);
+      lines.push(`${index + 1}: ${itemName(items[index])}${selected}`);
+    }
+
+    if (!items.some(Boolean)) {
+      lines.push(
+        '',
+        `Диагностика: пакетов=${this.inventoryPackets}, применено=${this.appliedLobbyPackets}, ошибок=${this.inventoryErrors}.`
+      );
+      if (this.packetSamples.length) lines.push(...this.packetSamples.map(value => `• ${value}`));
     }
 
     lines.push('', 'Команды: слот 4 | пкм | лкм | меню');
-    return lines.join('\n');
+    return lines.join('\n').slice(0, 3900);
   }
 
   helpText() {
@@ -207,6 +373,7 @@ class InventoryController {
     const normalized = cleanText(rawText).toLowerCase().replace(/ё/g, 'е');
 
     if (/^(?:меню|слоты|инвентарь|inventory|gui)$/i.test(normalized)) {
+      if (!this.bot?.currentWindow) await this.waitForInventorySync();
       return { handled: true, message: this.describeWindow() };
     }
 
@@ -242,13 +409,14 @@ class InventoryController {
     if (error) return { handled: true, message: error };
     if (this.bot.currentWindow) return this.clickGuiSlot(slot, 0);
 
+    await this.waitForInventorySync(1200);
     if (!Number.isInteger(slot) || slot < 1 || slot > 9) {
       return { handled: true, message: 'Без открытого меню номер хотбара должен быть от 1 до 9.' };
     }
 
     this.bot.setQuickBarSlot(slot - 1);
     await sleep(120);
-    return { handled: true, message: `✅ Выбран хотбар ${slot}: ${itemName(this.bot.heldItem)}` };
+    return { handled: true, message: `✅ Выбран хотбар ${slot}: ${itemName(this.hotbarItems()[slot - 1])}` };
   }
 
   async clickSlot(slot, button) {
@@ -303,7 +471,8 @@ class InventoryController {
     if (error) return { handled: true, message: error };
     if (this.bot.currentWindow) return { handled: true, message: 'Меню открыто. Напиши «пкм слот 15».' };
 
-    const held = itemName(this.bot.heldItem);
+    await this.waitForInventorySync(1200);
+    const held = itemName(this.hotbarItems()[Number(this.bot.quickBarSlot || 0)]);
     this.bot.activateItem(false);
     setTimeout(() => {
       try { this.bot?.deactivateItem(); } catch {}

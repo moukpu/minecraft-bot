@@ -16,6 +16,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64, minecraft-bot]
 
     steps:
+      - name: Start deployment timer
+        run: echo "DEPLOY_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -47,5 +50,37 @@ jobs:
           fi
           pm2 save
 
-      - name: Show status
-        run: pm2 status minecraft-bot
+      - name: Wait until bot is ready
+        run: |
+          get_status() {
+            pm2 jlist | node -e "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => { const processes = JSON.parse(input); const bot = processes.find(process => process.name === 'minecraft-bot'); process.stdout.write(bot?.pm2_env?.status || 'missing'); });"
+          }
+
+          for attempt in $(seq 1 30); do
+            FIRST_STATUS="$(get_status)"
+
+            if [ "$FIRST_STATUS" = "online" ]; then
+              sleep 5
+              SECOND_STATUS="$(get_status)"
+
+              if [ "$SECOND_STATUS" = "online" ]; then
+                echo "Minecraft bot is ready."
+                pm2 status minecraft-bot
+                exit 0
+              fi
+            fi
+
+            echo "Waiting for bot readiness: attempt $attempt/30, status=$FIRST_STATUS"
+            sleep 2
+          done
+
+          echo "Bot failed to become ready."
+          pm2 logs minecraft-bot --lines 100 --nostream || true
+          exit 1
+
+      - name: Notify Telegram that bot is ready
+        working-directory: /home/ubuntu/minecraft-bot
+        run: |
+          ELAPSED_SECONDS=$(( $(date +%s) - DEPLOY_STARTED_AT ))
+          COMMIT_MESSAGE="$(git -C "$GITHUB_WORKSPACE" log -1 --pretty=%s)"
+          node scripts/notify-deploy.js "$ELAPSED_SECONDS" "$GITHUB_SHA" "$COMMIT_MESSAGE"
